@@ -1,1 +1,1 @@
-asyncio
+websockets==12.0
