@@ -1,175 +1,142 @@
 #!/usr/bin/env python3
 import asyncio
 import os
-import traceback
 import logging
+import traceback
 
 from websockets.asyncio.server import serve, ServerConnection
 from websockets.exceptions import ConnectionClosed
 
-# ==========================
-# LOG BÁSICO
-# ==========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger("ws-redis-proxy")
+log = logging.getLogger("redis-ws-proxy")
 
-# (se quiser ver log interno da lib websockets, descomenta)
-# logging.getLogger("websockets").setLevel(logging.DEBUG)
-
-# ==========================
-# CONFIG
-# ==========================
+# CONFIG -----------------------------
 BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "6379"))
-
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.getenv("PROXY_PORT", "5000"))
 
-
-def log(msg: str) -> None:
-    logger.info(msg)
-
-
-async def ws_redis_proxy(ws: ServerConnection) -> None:
-    """
-    Para cada conexão WS:
-      - conecta no Redis BACKEND_HOST:BACKEND_PORT
-      - faz pipe WS <-> Redis (bytes crus, protocolo Redis RESP)
-    """
+# ------------------------------------
+# SERVIDOR HTTP PARA HEALTHCHECK
+# ------------------------------------
+async def http_handler(reader, writer):
     try:
-        peer = ws.remote_address
-    except Exception:
-        peer = None
+        request = await reader.readline()
+        if not request:
+            writer.close()
+            return
 
-    # path novo: ws.request.path (não existe mais ws.path)
-    try:
-        path = getattr(ws, "request", None)
-        path_str = path.path if path is not None else "?"
-    except Exception:
-        path_str = "?"
+        method, path, _ = request.decode().split(" ")
+        log.info(f"[HTTP] {method} {path}")
 
-    log(f"Nova conexão WS de {peer}, path={path_str}")
+        # Healthcheck Render
+        if method in ("GET", "HEAD"):
+            body = b"PONG HTTP\n"
+            headers = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: %d\r\n"
+                b"Connection: close\r\n\r\n" % len(body)
+            )
 
-    # 1) Tenta conectar no Redis backend
-    try:
-        log(f"Tentando conectar no Redis backend {BACKEND_HOST}:{BACKEND_PORT} ...")
-        redis_reader, redis_writer = await asyncio.open_connection(
-            BACKEND_HOST, BACKEND_PORT
-        )
-        log("Conectado no Redis backend com sucesso.")
+            writer.write(headers)
+            if method == "GET":
+                writer.write(body)
+
+        else:
+            writer.write(b"HTTP/1.1 405 METHOD NOT ALLOWED\r\n\r\n")
+
     except Exception as e:
-        log(f"[ERRO BACKEND] Falha ao conectar no Redis: {repr(e)}")
-        traceback.print_exc()
-        # Tenta enviar um erro legível pro cliente antes de fechar
-        err_msg = (
-            f"-ERR cannot connect to Redis backend {BACKEND_HOST}:{BACKEND_PORT}: {e}\r\n"
-        )
+        log.error(f"[HTTP] erro: {e}")
+    finally:
         try:
-            await ws.send(err_msg.encode("utf-8"))
+            await writer.drain()
         except Exception:
             pass
-        try:
-            await ws.close(code=1011, reason="backend connection failed")
-        except Exception:
-            pass
+        writer.close()
+
+
+# ------------------------------------
+# WEBSOCKET /ws  → Redis (TCP)
+# ------------------------------------
+async def ws_proxy(ws: ServerConnection):
+    peer = ws.remote_address
+
+    try:
+        path = ws.request.path
+    except:
+        path = "?"
+
+    log.info(f"[WS] Nova conexão de {peer}, path={path}")
+
+    # Prevencion: só aceitar /ws
+    if path != "/ws":
+        log.warning(f"[WS] conexão rejeitada em {path}")
+        await ws.close(code=4000, reason="use /ws")
         return
 
-    async def ws_to_redis() -> None:
-        """
-        Lê frames do WebSocket e envia para o Redis.
-        """
+    # Conectar ao Redis
+    try:
+        redis_r, redis_w = await asyncio.open_connection(BACKEND_HOST, BACKEND_PORT)
+        log.info("[WS] Conectado ao Redis")
+    except Exception as e:
+        log.error(f"[WS] ERRO Redis: {e}")
+        await ws.send(f"-ERR Redis unavailable {e}".encode())
+        await ws.close(code=1011, reason="redis error")
+        return
+
+    async def ws_to_redis():
         try:
             async for msg in ws:
-                if isinstance(msg, str):
-                    data = msg.encode("utf-8")
-                    kind = "text"
-                else:
-                    data = msg
-                    kind = "binary"
-
-                log(f"WS→Redis {len(data)} bytes (tipo={kind})")
-                redis_writer.write(data)
-                await redis_writer.drain()
-        except ConnectionClosed as e:
-            log(
-                f"ws_to_redis: WS fechado "
-                f"code={e.code} reason={e.reason!r}"
-            )
+                data = msg if isinstance(msg, bytes) else msg.encode()
+                log.info(f"[WS→Redis] {len(data)} bytes")
+                redis_w.write(data)
+                await redis_w.drain()
         except Exception as e:
-            log(f"ws_to_redis: erro inesperado: {repr(e)}")
-            traceback.print_exc()
+            log.error(f"[WS→Redis] erro: {e}")
         finally:
-            try:
-                redis_writer.close()
-            except Exception:
-                pass
+            try: redis_w.close()
+            except: pass
 
-    async def redis_to_ws() -> None:
-        """
-        Lê bytes do Redis e manda de volta pro WebSocket.
-        """
+    async def redis_to_ws():
         try:
             while True:
-                data = await redis_reader.read(4096)
+                data = await redis_r.read(4096)
                 if not data:
-                    log("redis_to_ws: EOF do Redis (conexão fechada).")
+                    log.info("[Redis] EOF")
                     break
-                log(f"Redis→WS {len(data)} bytes")
-                await ws.send(data)  # envia como frame binário
-        except ConnectionClosed as e:
-            log(
-                f"redis_to_ws: WS fechado "
-                f"code={e.code} reason={e.reason!r}"
-            )
+                log.info(f"[Redis→WS] {len(data)} bytes")
+                await ws.send(data)
         except Exception as e:
-            log(f"redis_to_ws: erro inesperado: {repr(e)}")
-            traceback.print_exc()
+            log.error(f"[Redis→WS] erro: {e}")
         finally:
-            try:
-                await ws.close()
-            except Exception:
-                pass
+            try: await ws.close()
+            except: pass
 
-    # Cria as duas tasks de pipe
-    t1 = asyncio.create_task(ws_to_redis(), name="ws_to_redis")
-    t2 = asyncio.create_task(redis_to_ws(), name="redis_to_ws")
+    t1 = asyncio.create_task(ws_to_redis())
+    t2 = asyncio.create_task(redis_to_ws())
 
-    done, pending = await asyncio.wait(
-        [t1, t2],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-
-    log(f"Tasks finalizadas: done={len(done)}, pending={len(pending)}")
-    for t in pending:
-        t.cancel()
-        try:
-            await t
-        except Exception:
-            pass
-
-    log(f"Conexão encerrada com {peer}")
+    await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+    log.info(f"[WS] Conexão encerrada: {peer}")
 
 
-async def main() -> None:
-    log(f"Iniciando WebSocket Redis Proxy em ws://{PROXY_HOST}:{PROXY_PORT}")
-    log(f"Redis backend alvo: {BACKEND_HOST}:{BACKEND_PORT}")
+# ------------------------------------
+# MAIN SERVER
+# ------------------------------------
+async def main():
+    log.info(f"Iniciando Redis WS Proxy em ws://{PROXY_HOST}:{PROXY_PORT}/ws")
+    log.info(f"Redis alvo: {BACKEND_HOST}:{BACKEND_PORT}")
 
-    async with serve(
-        ws_redis_proxy,
-        PROXY_HOST,
-        PROXY_PORT,
-        max_size=None,
-        max_queue=None,
-    ) as server:
-        log("Servidor WS pronto. Aguardando conexões...")
-        await server.serve_forever()
+    # HTTP server para Render healthcheck
+    asyncio.create_task(asyncio.start_server(http_handler, PROXY_HOST, PROXY_PORT))
 
+    # WebSocket somente em /ws
+    async with serve(ws_proxy, PROXY_HOST, PROXY_PORT, max_size=None, max_queue=None):
+        log.info("Servidor pronto.")
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log("Encerrando por KeyboardInterrupt...")
+    asyncio.run(main())
