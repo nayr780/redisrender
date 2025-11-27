@@ -3,12 +3,13 @@ import asyncio
 import os
 import logging
 import traceback
+from urllib.parse import urlparse
 
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 # ==========================
-# LOG BÁSICO
+# LOG
 # ==========================
 logging.basicConfig(
     level=logging.INFO,
@@ -16,42 +17,54 @@ logging.basicConfig(
 )
 log = logging.getLogger("ws-redis-proxy")
 
-# Silenciar barulho interno do websockets (HEAD / handshake, etc.)
+# silencia barulho de handshake do websockets (HEAD etc.)
 logging.getLogger("websockets").setLevel(logging.CRITICAL)
 logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 logging.getLogger("websockets.asyncio.server").setLevel(logging.CRITICAL)
 logging.getLogger("websockets.http11").setLevel(logging.CRITICAL)
-
-# ==========================
-# CONFIG
-# ==========================
-
-# Redis REAL (no Render, aponte BACKEND_HOST/BACKEND_PORT pro Redis de verdade)
-BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
-BACKEND_PORT = int(os.getenv("BACKEND_PORT", "6379"))
-
-# Porta em que o serviço escuta.
-#  - local: usa PROXY_PORT (default 5000)
-#  - Render: ele seta PORT, então usamos PORT primeiro.
-PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
-PROXY_PORT = int(os.getenv("PORT", os.getenv("PROXY_PORT", "5000")))
-
-# Token opcional:
-#  - Se definido, o PRIMEIRO frame do WebSocket tem que ser exatamente esse token (texto).
-#  - Depois disso, o tráfego vira Redis RESP normal.
-WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN")  # ex: "minha_senha_ws"
 
 
 def info(msg: str) -> None:
     log.info(msg)
 
 
+# ==========================
+# CONFIG DO BACKEND REDIS
+# ==========================
+
+# Você pode usar:
+#   BACKEND_URL = redis://default:senha@host:port/0
+BACKEND_URL = os.getenv("BACKEND_URL")
+
+# Ou então setar HOST/PORT/PASSWORD separados
+BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
+BACKEND_PORT = int(os.getenv("BACKEND_PORT", "6379"))
+BACKEND_PASSWORD = os.getenv("BACKEND_PASSWORD")  # ex: test1234
+
+# Se BACKEND_URL estiver definido, faz o parse
+if BACKEND_URL:
+    u = urlparse(BACKEND_URL)
+    if u.hostname:
+        BACKEND_HOST = u.hostname
+    if u.port:
+        BACKEND_PORT = u.port
+    if u.password:
+        BACKEND_PASSWORD = u.password
+
+# Porta de escuta do serviço (Render seta PORT)
+PROXY_HOST = "0.0.0.0"
+PROXY_PORT = int(os.getenv("PORT", "10000"))
+
+
+# ==========================
+# HANDLER WS
+# ==========================
 async def ws_redis_proxy(ws) -> None:
     """
     Para cada conexão WebSocket:
-      - (opcional) valida um token no primeiro frame
       - conecta no Redis BACKEND_HOST:BACKEND_PORT
-      - faz pipe WS <-> Redis (bytes crus, protocolo RESP)
+      - se tiver BACKEND_PASSWORD, manda AUTH
+      - faz pipe WS <-> Redis (bytes crus RESP2)
     """
     try:
         peer = ws.remote_address
@@ -60,45 +73,7 @@ async def ws_redis_proxy(ws) -> None:
 
     info(f"[WS] Nova conexão de {peer}")
 
-    # -----------------------------------------------------------
-    # 1) Auth simples via primeiro frame (se WS_AUTH_TOKEN estiver setado)
-    # -----------------------------------------------------------
-    if WS_AUTH_TOKEN:
-        try:
-            init_msg = await ws.recv()
-        except ConnectionClosed as e:
-            info(
-                f"[AUTH] WS fechado antes do token: "
-                f"code={e.code} reason={e.reason!r}"
-            )
-            return
-        except Exception as e:
-            info(f"[AUTH] erro ao ler token inicial: {repr(e)}")
-            traceback.print_exc()
-            return
-
-        if isinstance(init_msg, bytes):
-            token = init_msg.decode("utf-8", "replace")
-        else:
-            token = init_msg
-
-        if token != WS_AUTH_TOKEN:
-            info(f"[AUTH] Token inválido de {peer}")
-            try:
-                await ws.send(b"-NOAUTH invalid token\r\n")
-            except Exception:
-                pass
-            try:
-                await ws.close(code=4001, reason="invalid token")
-            except Exception:
-                pass
-            return
-
-        info(f"[AUTH] Token OK para {peer}")
-
-    # -----------------------------------------------------------
-    # 2) Conecta no Redis backend
-    # -----------------------------------------------------------
+    # 1) Conecta no Redis backend
     try:
         info(f"[WS] Conectando no Redis {BACKEND_HOST}:{BACKEND_PORT} ...")
         redis_reader, redis_writer = await asyncio.open_connection(
@@ -122,10 +97,39 @@ async def ws_redis_proxy(ws) -> None:
             pass
         return
 
-    # -----------------------------------------------------------
-    # 3) Pipes WS → Redis e Redis → WS
-    # -----------------------------------------------------------
+    # 2) AUTH opcional no backend
+    if BACKEND_PASSWORD:
+        try:
+            pwd = BACKEND_PASSWORD
+            auth_cmd = (
+                f"*2\r\n"
+                f"$4\r\nAUTH\r\n"
+                f"${len(pwd)}\r\n{pwd}\r\n"
+            ).encode("utf-8")
+            info("[WS] Enviando AUTH para o Redis backend...")
+            redis_writer.write(auth_cmd)
+            await redis_writer.drain()
 
+            auth_resp = await redis_reader.read(1024)
+            info(f"[WS] Resposta AUTH: {auth_resp!r}")
+        except Exception as e:
+            info(f"[WS] ERRO durante AUTH no backend: {repr(e)}")
+            traceback.print_exc()
+            try:
+                await ws.send(b"-ERR backend AUTH failed\r\n")
+            except Exception:
+                pass
+            try:
+                await ws.close(code=1011, reason="backend auth failed")
+            except Exception:
+                pass
+            try:
+                redis_writer.close()
+            except Exception:
+                pass
+            return
+
+    # 3) Pipes WS <-> Redis
     async def ws_to_redis():
         try:
             async for msg in ws:
@@ -135,15 +139,11 @@ async def ws_redis_proxy(ws) -> None:
                 else:
                     data = msg
                     kind = "binary"
-
-                info(f"[WS→Redis] {len(data)} bytes (tipo={kind})")
+                info(f"[WS→Redis] {len(data)} bytes ({kind})")
                 redis_writer.write(data)
                 await redis_writer.drain()
         except ConnectionClosed as e:
-            info(
-                f"[WS→Redis] WS fechado "
-                f"code={e.code} reason={e.reason!r}"
-            )
+            info(f"[WS→Redis] WS fechado code={e.code} reason={e.reason!r}")
         except Exception as e:
             info(f"[WS→Redis] erro inesperado: {repr(e)}")
             traceback.print_exc()
@@ -163,10 +163,7 @@ async def ws_redis_proxy(ws) -> None:
                 info(f"[Redis→WS] {len(data)} bytes")
                 await ws.send(data)
         except ConnectionClosed as e:
-            info(
-                f"[Redis→WS] WS fechado "
-                f"code={e.code} reason={e.reason!r}"
-            )
+            info(f"[Redis→WS] WS fechado code={e.code} reason={e.reason!r}")
         except Exception as e:
             info(f"[Redis→WS] erro inesperado: {repr(e)}")
             traceback.print_exc()
@@ -195,10 +192,12 @@ async def ws_redis_proxy(ws) -> None:
     info(f"[WS] Conexão encerrada com {peer}")
 
 
+# ==========================
+# MAIN
+# ==========================
 async def main() -> None:
-    info(f"Iniciando Redis WS Proxy em ws://{PROXY_HOST}:{PROXY_PORT}/ (qualquer path)")
+    info(f"Iniciando Redis WS Proxy em ws://{PROXY_HOST}:{PROXY_PORT} (Render → wss://redisrender.onrender.com)")
     info(f"Redis alvo: {BACKEND_HOST}:{BACKEND_PORT}")
-
     async with serve(
         ws_redis_proxy,
         PROXY_HOST,
@@ -207,7 +206,7 @@ async def main() -> None:
         max_queue=None,
     ):
         info("Servidor WS pronto. Aguardando conexões...")
-        await asyncio.Future()  # run forever
+        await asyncio.Future()  # roda pra sempre
 
 
 if __name__ == "__main__":
