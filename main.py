@@ -1,228 +1,103 @@
 #!/usr/bin/env python3
 import asyncio
 import os
-import logging
-import traceback
+import websockets
 
-from websockets.asyncio.server import serve, ServerConnection
-from websockets.exceptions import ConnectionClosed
+WS_URL = os.getenv("REDIS_WS_URL", "ws://127.0.0.1:5000")
+WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN")  # se setar no servidor, setar aqui também
 
-# ==========================
-# LOG BÁSICO
-# ==========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("ws-redis-proxy")
-
-# Silenciar barulho do websockets (erros de HEAD / handshake)
-logging.getLogger("websockets").setLevel(logging.CRITICAL)
-logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
-logging.getLogger("websockets.asyncio.server").setLevel(logging.CRITICAL)
-logging.getLogger("websockets.http11").setLevel(logging.CRITICAL)
-
-# ==========================
-# CONFIG
-# ==========================
-
-# Redis verdadeiro (Render: seta BACKEND_HOST/PORT pro seu Redis)
-BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
-BACKEND_PORT = int(os.getenv("BACKEND_PORT", "6379"))
-
-# Porta de escuta do serviço
-# No Render, normalmente vem PORT no env
-PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
-PROXY_PORT = int(os.getenv("PORT", os.getenv("PROXY_PORT", "5000")))
-
-# Token opcional: ws://host/ws?token=SEU_TOKEN
-WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN")  # se None, sem auth
-
-
-def info(msg: str) -> None:
-    log.info(msg)
-
-
-async def ws_redis_proxy(ws: ServerConnection) -> None:
+def encode_resp(*parts: str) -> bytes:
     """
-    Para cada conexão WS:
-      - (opcional) valida token via querystring
-      - conecta no Redis BACKEND_HOST:BACKEND_PORT
-      - faz pipe WS <-> Redis (bytes crus, protocolo Redis RESP)
+    Codifica comandos simples Redis em RESP2.
+    Ex: encode_resp("SET", "foo", "bar")
     """
-    # Algumas infos úteis
+    out = f"*{len(parts)}\r\n"
+    for p in parts:
+        pb = p.encode("utf-8")
+        out += f"${len(pb)}\r\n"
+        out += p + "\r\n"
+    return out.encode("utf-8")
+
+
+async def send_cmd(ws, *parts: str) -> bytes:
+    raw = encode_resp(*parts)
+    print(f"\n[CLIENT] >> CMD {parts}")
+    print(f"[CLIENT] >> RAW ({len(raw)} bytes): {raw[:60]!r}...")
+    await ws.send(raw)
+    resp = await ws.recv()
+    if isinstance(resp, str):
+        resp_b = resp.encode("utf-8")
+    else:
+        resp_b = resp
+    print(f"[CLIENT] << RAW BYTES ({len(resp_b)}): {resp_b[:60]!r}...")
+    print("[CLIENT] << DECODED:\n", resp_b.decode("utf-8", "replace"))
+    return resp_b
+
+
+async def main():
+    print(f"🔌 Conectando ao WebSocket: {WS_URL}")
     try:
-        peer = ws.remote_address
-    except Exception:
-        peer = None
+        async with websockets.connect(WS_URL, max_size=None) as ws:
+            print("🟢 Conectado!")
 
-    try:
-        req = ws.request  # websockets 15.x
-        path = req.path
-        raw_query = req.query  # dict-like
-    except Exception:
-        path = "?"
-        raw_query = {}
+            # 1) Token opcional
+            if WS_AUTH_TOKEN:
+                print("\n== AUTH TOKEN ==\n")
+                await ws.send(WS_AUTH_TOKEN)
+                print("[CLIENT] >> token enviado")
 
-    info(f"[WS] Nova conexão de {peer}, path={path}")
+            # 2) PING
+            print("\n== PING ==\n")
+            await send_cmd(ws, "PING")
 
-    # ------------------------------------------------------------------
-    # 1) Só aceitar em /ws
-    # ------------------------------------------------------------------
-    if path != "/ws":
-        info(f"[WS] Rejeitando conexão em path {path}, esperado /ws")
-        try:
-            await ws.close(code=4000, reason="use /ws")
-        except Exception:
-            pass
-        return
+            # 3) Strings
+            print("\n== STRINGS ==\n")
+            await send_cmd(ws, "SET", "user", "ryan")
+            await send_cmd(ws, "GET", "user")
 
-    # ------------------------------------------------------------------
-    # 2) Auth por token (se configurado)
-    # ------------------------------------------------------------------
-    if WS_AUTH_TOKEN:
-        # raw_query pode ser um dict ou Mapping[str, str]
-        token = None
-        try:
-            token = raw_query.get("token")
-        except Exception:
-            # fallback manual se não for dict
-            # req.target geralmente vem como "/ws?token=xxx"
-            try:
-                target = req.target  # tipo: "/ws?token=xxx"
-                if "?" in target:
-                    qs = target.split("?", 1)[1]
-                    params = dict(
-                        p.split("=", 1)
-                        for p in qs.split("&")
-                        if "=" in p
-                    )
-                    token = params.get("token")
-            except Exception:
-                token = None
+            # 4) Counter
+            print("\n== COUNTER (INCR/INCRBY) ==\n")
+            await send_cmd(ws, "SET", "counter", "0")
+            await send_cmd(ws, "INCR", "counter")
+            await send_cmd(ws, "INCRBY", "counter", "10")
+            await send_cmd(ws, "GET", "counter")
 
-        if token != WS_AUTH_TOKEN:
-            info(f"[WS] Token inválido de {peer}")
-            try:
-                await ws.send(b"-NOAUTH invalid token\r\n")
-            except Exception:
-                pass
-            try:
-                await ws.close(code=4001, reason="invalid token")
-            except Exception:
-                pass
-            return
+            # 5) List
+            print("\n== LIST (LPUSH/LRANGE) ==\n")
+            await send_cmd(ws, "DEL", "queue")
+            await send_cmd(ws, "LPUSH", "queue", "a", "b", "c")
+            await send_cmd(ws, "LRANGE", "queue", "0", "-1")
 
-        info(f"[WS] Token OK para {peer}")
+            # 6) Hash
+            print("\n== HASH (HSET/HGETALL) ==\n")
+            await send_cmd(ws, "HSET", "profile", "name", "Ryan", "age", "22")
+            await send_cmd(ws, "HGETALL", "profile")
 
-    # ------------------------------------------------------------------
-    # 3) Conecta no Redis backend
-    # ------------------------------------------------------------------
-    try:
-        info(f"[WS] Conectando no Redis {BACKEND_HOST}:{BACKEND_PORT} ...")
-        redis_reader, redis_writer = await asyncio.open_connection(
-            BACKEND_HOST, BACKEND_PORT
-        )
-        info("[WS] Conectado no Redis backend.")
+            # 7) Set
+            print("\n== SET (SADD/SMEMBERS) ==\n")
+            await send_cmd(ws, "SADD", "tags", "python", "redis", "ws")
+            await send_cmd(ws, "SMEMBERS", "tags")
+
+            # 8) Streams
+            print("\n== STREAMS (XADD/XRANGE) ==\n")
+            await send_cmd(ws, "XADD", "mystream", "*", "msg", "hello")
+            await send_cmd(ws, "XRANGE", "mystream", "-", "+")
+
+            # 9) KEYS
+            print("\n== KEYS * ==\n")
+            await send_cmd(ws, "KEYS", "*")
+
+            # 10) DEL
+            print("\n== DEL ==\n")
+            await send_cmd(ws, "DEL", "user")
+            await send_cmd(ws, "GET", "user")
+
+            print("\n✅ TESTES FINALIZADOS")
+    except websockets.ConnectionClosed as e:
+        print(f"\n[CLIENT] 🔴 ConnectionClosed code={e.code} reason={e.reason!r}")
     except Exception as e:
-        info(f"[WS] ERRO ao conectar no Redis: {repr(e)}")
-        traceback.print_exc()
-        msg = f"-ERR cannot connect to Redis backend {BACKEND_HOST}:{BACKEND_PORT}: {e}\r\n"
-        try:
-            await ws.send(msg.encode("utf-8"))
-        except Exception:
-            pass
-        try:
-            await ws.close(code=1011, reason="backend connection failed")
-        except Exception:
-            pass
-        return
-
-    # ------------------------------------------------------------------
-    # 4) PIPES: WS → Redis e Redis → WS
-    # ------------------------------------------------------------------
-
-    async def ws_to_redis():
-        try:
-            async for msg in ws:
-                if isinstance(msg, str):
-                    data = msg.encode("utf-8")
-                    kind = "text"
-                else:
-                    data = msg
-                    kind = "binary"
-
-                info(f"[WS→Redis] {len(data)} bytes (tipo={kind})")
-                redis_writer.write(data)
-                await redis_writer.drain()
-        except ConnectionClosed as e:
-            info(f"[WS→Redis] WS fechado code={e.code} reason={e.reason!r}")
-        except Exception as e:
-            info(f"[WS→Redis] erro inesperado: {repr(e)}")
-            traceback.print_exc()
-        finally:
-            try:
-                redis_writer.close()
-            except Exception:
-                pass
-
-    async def redis_to_ws():
-        try:
-            while True:
-                data = await redis_reader.read(4096)
-                if not data:
-                    info("[Redis→WS] EOF do Redis (conexão fechada).")
-                    break
-                info(f"[Redis→WS] {len(data)} bytes")
-                await ws.send(data)
-        except ConnectionClosed as e:
-            info(f"[Redis→WS] WS fechado code={e.code} reason={e.reason!r}")
-        except Exception as e:
-            info(f"[Redis→WS] erro inesperado: {repr(e)}")
-            traceback.print_exc()
-        finally:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-
-    t1 = asyncio.create_task(ws_to_redis(), name="ws_to_redis")
-    t2 = asyncio.create_task(redis_to_ws(), name="redis_to_ws")
-
-    done, pending = await asyncio.wait(
-        [t1, t2],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-
-    info(f"[WS] Tasks finalizadas: done={len(done)}, pending={len(pending)}")
-    for t in pending:
-        t.cancel()
-        try:
-            await t
-        except Exception:
-            pass
-
-    info(f"[WS] Conexão encerrada com {peer}")
-
-
-async def main() -> None:
-    info(f"Iniciando Redis WS Proxy em ws://{PROXY_HOST}:{PROXY_PORT}/ws")
-    info(f"Redis alvo: {BACKEND_HOST}:{BACKEND_PORT}")
-
-    # Só UM servidor na porta: o próprio websockets
-    async with serve(
-        ws_redis_proxy,
-        PROXY_HOST,
-        PROXY_PORT,
-        max_size=None,
-        max_queue=None,
-    ):
-        info("Servidor WS pronto. Aguardando conexões...")
-        await asyncio.Future()  # run forever
+        print(f"\n[CLIENT] 🔴 Erro inesperado: {repr(e)}")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        info("Encerrando por KeyboardInterrupt...")
+    asyncio.run(main())
