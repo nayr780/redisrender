@@ -85,11 +85,12 @@ def wait_redis_ready(host, port, timeout=10):
 def start_local_redis():
     global REDIS_PROC, REDIS_HOST, REDIS_PORT, REDIS_SSL
 
-    # Se estiver no Render e não tiver REDIS_URL → sobe redis local
+    # Se REDIS_URL foi fornecida, não inicia local
     if RAW_URL:
         info("[REDIS] Usando Redis externo via REDIS_URL")
         return
 
+    # Render SEM REDIS_URL → usar Redis embutido
     if not (EMBED_LOCAL or IS_RENDER):
         info("[REDIS] Redis embutido desativado.")
         return
@@ -100,28 +101,20 @@ def start_local_redis():
     REDIS_PORT = 6379
     REDIS_SSL = False
 
+    # Verifica se já há Redis rodando
     if wait_redis_ready(REDIS_HOST, REDIS_PORT, timeout=1):
         info("[REDIS] Redis já está rodando. Não vou subir outro.")
         return
 
-    path = shutil.which("redis-server")
-    if not path:
-        info("[REDIS] redis-server não encontrado no PATH")
-        if IS_LINUX:
-            info("[REDIS] Tentando instalar via apt-get")
-            try:
-                subprocess.check_call(["apt-get", "update"])
-                subprocess.check_call(["apt-get", "install", "-y", "redis-server"])
-            except Exception as e:
-                info(f"[REDIS] Falha ao instalar redis-server: {e}")
-                return
-            path = shutil.which("redis-server")
-            if not path:
-                info("[REDIS] redis-server não encontrado após instalar.")
-                return
-        else:
-            info("[REDIS] Sistema não é Linux — não posso instalar redis-server.")
-            return
+    # Caminho para binário incluído no repo
+    path = os.path.join(os.getcwd(), "bin", "redis-server")
+
+    if not os.path.exists(path):
+        info(f"[REDIS] Binário não encontrado: {path}")
+        info("[REDIS] Certifique-se que bin/redis-server está no repositório.")
+        return
+
+    info(f"[REDIS] Iniciando redis-server pelo bin: {path}")
 
     cmd = [
         path,
@@ -131,15 +124,18 @@ def start_local_redis():
         "--save", "",
     ]
 
-    info(f"[REDIS] Iniciando redis-server: {' '.join(cmd)}")
-
     REDIS_PROC = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
     )
 
     info(f"[REDIS] PID = {REDIS_PROC.pid}")
 
-    wait_redis_ready(REDIS_HOST, REDIS_PORT, timeout=10)
+    if not wait_redis_ready(REDIS_HOST, REDIS_PORT, timeout=10):
+        info("[REDIS] Falhou ao subir redis-server embutido.")
+        return
+
 
 
 ###########################################################
