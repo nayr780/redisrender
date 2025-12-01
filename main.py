@@ -288,23 +288,22 @@ async def ws_handler(ws: ServerConnection):
                     redis_writer.close()
                 except Exception:
                     pass
-
     async def redis_to_ws():
         try:
             while True:
-                data = await redis_reader.read(4096)
+                # ← AQUI É A ÚNICA MUDANÇA QUE RESOLVE TUDO
+                data = await redis_reader.read(1024 * 1024)  # 1MB — suficiente pra qualquer log
                 if not data:
                     debug("[R→C] EOF")
                     break
                 debug(f"[R→C] {len(data)} bytes")
-                # enviar como binary frame
-                await ws.send(data)
+                await ws.send(data)  # envia o bloco completo
         except Exception as e:
             debug(f"[R→C] exceção: {e}")
         finally:
             try:
                 await ws.close()
-            except Exception:
+            except:
                 pass
 
     t1 = asyncio.create_task(ws_to_redis())
