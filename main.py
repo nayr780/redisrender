@@ -291,42 +291,77 @@ async def ws_handler(ws: ServerConnection):
     async def redis_to_ws():
         try:
             while True:
-                # ← AQUI É A ÚNICA MUDANÇA QUE RESOLVE TUDO
-                data = await redis_reader.read(1024 * 1024)  # 1MB — suficiente pra qualquer log
-                if not data:
+                line = await redis_reader.readline()  # lê até \r\n
+                if not line:
                     debug("[R→C] EOF")
                     break
-                debug(f"[R→C] {len(data)} bytes")
-                await ws.send(data)  # envia o bloco completo
+    
+                # Se for header de array RESP (ex: *3\r\n), coletamos todo o array e enviamos junto
+                if line.startswith(b"*"):
+                    try:
+                        count = int(line[1:-2])
+                    except Exception:
+                        count = None
+    
+                    buf = bytearray()
+                    buf.extend(line)
+    
+                    if count is None:
+                        # fallback: envia o header sozinho
+                        await ws.send(bytes(buf))
+                        continue
+    
+                    # para cada item do array, lemos o token (linha) e, se for bulk, o payload exato
+                    for _ in range(count):
+                        token_line = await redis_reader.readline()
+                        if not token_line:
+                            break
+                        buf.extend(token_line)
+    
+                        if token_line.startswith(b"$"):
+                            # parse length (pode ser -1 para NULL)
+                            try:
+                                ln = int(token_line[1:-2])
+                            except Exception:
+                                ln = None
+    
+                            # CORREÇÃO: ler também quando ln == 0 (bulk vazio)
+                            if ln is not None and ln >= 0:
+                                # lê payload + \r\n exatamente (se ln == 0, lerá apenas \r\n)
+                                chunk = await redis_reader.readexactly(ln + 2)
+                                buf.extend(chunk)
+    
+                    debug(f"[R→C] ARRAY {len(buf)} bytes")
+                    await ws.send(bytes(buf))
+                    continue
+    
+                # Se não for array, pode ser linha simples ou bulk ($...)
+                buf = bytearray()
+                buf.extend(line)
+    
+                if line.startswith(b"$"):
+                    try:
+                        ln = int(line[1:-2])
+                    except Exception:
+                        ln = None
+    
+                    # CORREÇÃO: ler também quando ln == 0
+                    if ln is not None and ln >= 0:
+                        chunk = await redis_reader.readexactly(ln + 2)
+                        buf.extend(chunk)
+    
+                debug(f"[R→C] TOKEN {len(buf)} bytes: {buf[:200]!r}...")
+                await ws.send(bytes(buf))
+    
+        except asyncio.IncompleteReadError:
+            debug("[R→C] IncompleteReadError (connection closed)")
         except Exception as e:
             debug(f"[R→C] exceção: {e}")
         finally:
             try:
                 await ws.close()
-            except:
+            except Exception:
                 pass
-
-    t1 = asyncio.create_task(ws_to_redis())
-    t2 = asyncio.create_task(redis_to_ws())
-
-    await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
-
-    info(f"[WS] Conexão encerrada com {peer}")
-
-# small helper context manager to suppress close errors
-class suppress_close:
-    def __init__(self, obj):
-        self.obj = obj
-    def __enter__(self):
-        return self.obj
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            if hasattr(self.obj, "wait_closed"):
-                # asyncio stream writer has wait_closed
-                pass
-        except Exception:
-            pass
-        return False
 
 ###########################################################
 # process_request -> responde HTTP GET / para healthcheck
