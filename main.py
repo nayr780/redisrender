@@ -3,13 +3,10 @@ import asyncio
 import os
 import sys
 import logging
-import traceback
 import subprocess
-import shutil
 import socket
 import time
 import threading
-import signal
 from urllib.parse import urlparse
 from websockets.asyncio.server import serve, ServerConnection
 
@@ -75,6 +72,9 @@ else:
     REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_SSL = False
 
+# encoding used for 1:1 byte-preserving string<->bytes conversions
+ENC = "latin-1"
+
 ###########################################################
 # HELPERS
 ###########################################################
@@ -131,7 +131,7 @@ def _start_monitor_thread(proc):
     return (t_out, t_err, t_wait)
 
 ###########################################################
-# START LOCAL REDIS
+# START LOCAL REDIS (opcional)
 ###########################################################
 def start_local_redis():
     global REDIS_PROC, REDIS_HOST, REDIS_PORT, REDIS_SSL, REDIS_MON_THREAD
@@ -211,11 +211,9 @@ def start_local_redis():
     # espera curto para validar startup
     if not wait_redis_ready(REDIS_HOST, REDIS_PORT, timeout=10):
         info("[REDIS] Falhou ao subir redis-server embutido.")
-        # tenta ler último stderr (já sendo logado pelas threads)
         return
 
     info("[REDIS] redis-server embutido iniciado com sucesso")
-
 
 ###########################################################
 # WebSocket <-> Redis proxy
@@ -246,7 +244,8 @@ async def ws_handler(ws: ServerConnection):
         if token != WS_AUTH_TOKEN:
             info(f"[WS] Token inválido: {token}")
             try:
-                await ws.send(b"-NOAUTH Invalid token\r\n")
+                # enviar texto (não bytes)
+                await ws.send("-NOAUTH Invalid token\r\n")
             except Exception:
                 pass
             await ws.close(code=4001)
@@ -263,7 +262,8 @@ async def ws_handler(ws: ServerConnection):
         msg = f"-ERR cannot connect to Redis backend {REDIS_HOST}:{REDIS_PORT}: {e}\r\n"
         info(f"[WS] {msg.strip()}")
         try:
-            await ws.send(msg.encode())
+            # enviar texto (não bytes)
+            await ws.send(msg)
         except Exception:
             pass
         await ws.close(code=1011)
@@ -272,87 +272,83 @@ async def ws_handler(ws: ServerConnection):
     async def ws_to_redis():
         try:
             async for msg in ws:
+                # msg pode ser str ou bytes
                 if isinstance(msg, str):
-                    data = msg.encode()
+                    data = msg.encode(ENC)
                 else:
-                    # already bytes or memoryview
                     data = bytes(msg)
-                debug(f"[C→R] {len(data)} bytes")
+                # escreve direto no redis backend (TCP)
                 redis_writer.write(data)
                 await redis_writer.drain()
         except Exception as e:
             debug(f"[C→R] exceção: {e}")
         finally:
-            with suppress_close(redis_writer):
-                try:
-                    redis_writer.close()
-                except Exception:
-                    pass
+            try:
+                redis_writer.close()
+            except Exception:
+                pass
+
     async def redis_to_ws():
         try:
             while True:
-                line = await redis_reader.readline()  # lê até \r\n
+                # lemos uma linha RESP (até \r\n)
+                line = await redis_reader.readline()
                 if not line:
                     debug("[R→C] EOF")
                     break
-    
-                # Se for header de array RESP (ex: *3\r\n), coletamos todo o array e enviamos junto
+
+                # ARRAY (*N\r\n)
                 if line.startswith(b"*"):
                     try:
-                        count = int(line[1:-2])
+                        # decodifica header pra ascii antes de int()
+                        count = int(line[1:-2].decode("ascii"))
                     except Exception:
                         count = None
-    
+
                     buf = bytearray()
                     buf.extend(line)
-    
+
                     if count is None:
-                        # fallback: envia o header sozinho
-                        await ws.send(bytes(buf))
+                        # fallback: envia o header como texto
+                        await ws.send(bytes(buf).decode(ENC))
                         continue
-    
-                    # para cada item do array, lemos o token (linha) e, se for bulk, o payload exato
+
                     for _ in range(count):
-                        token_line = await redis_reader.readline()
-                        if not token_line:
+                        tok = await redis_reader.readline()
+                        if not tok:
                             break
-                        buf.extend(token_line)
-    
-                        if token_line.startswith(b"$"):
-                            # parse length (pode ser -1 para NULL)
+                        buf.extend(tok)
+
+                        if tok.startswith(b"$"):
                             try:
-                                ln = int(token_line[1:-2])
+                                ln = int(tok[1:-2].decode("ascii"))
                             except Exception:
                                 ln = None
-    
-                            # CORREÇÃO: ler também quando ln == 0 (bulk vazio)
+
                             if ln is not None and ln >= 0:
-                                # lê payload + \r\n exatamente (se ln == 0, lerá apenas \r\n)
+                                # lê payload + \r\n exatamente
                                 chunk = await redis_reader.readexactly(ln + 2)
                                 buf.extend(chunk)
-    
-                    debug(f"[R→C] ARRAY {len(buf)} bytes")
-                    await ws.send(bytes(buf))
+
+                    # envia o array completo como string codificada latin-1
+                    await ws.send(bytes(buf).decode(ENC))
                     continue
-    
-                # Se não for array, pode ser linha simples ou bulk ($...)
+
+                # BULK ($...)
                 buf = bytearray()
                 buf.extend(line)
-    
+
                 if line.startswith(b"$"):
                     try:
-                        ln = int(line[1:-2])
+                        ln = int(line[1:-2].decode("ascii"))
                     except Exception:
                         ln = None
-    
-                    # CORREÇÃO: ler também quando ln == 0
                     if ln is not None and ln >= 0:
                         chunk = await redis_reader.readexactly(ln + 2)
                         buf.extend(chunk)
-    
-                debug(f"[R→C] TOKEN {len(buf)} bytes: {buf[:200]!r}...")
-                await ws.send(bytes(buf))
-    
+
+                await ws.send(bytes(buf).decode(ENC))
+
         except asyncio.IncompleteReadError:
             debug("[R→C] IncompleteReadError (connection closed)")
         except Exception as e:
@@ -362,6 +358,20 @@ async def ws_handler(ws: ServerConnection):
                 await ws.close()
             except Exception:
                 pass
+
+    # cria tasks e espera
+    t1 = asyncio.create_task(ws_to_redis())
+    t2 = asyncio.create_task(redis_to_ws())
+    done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+
+    # cancel remaining
+    for p in pending:
+        try:
+            p.cancel()
+        except Exception:
+            pass
+
+    info(f"[WS] Conexão encerrada com {peer}")
 
 ###########################################################
 # process_request -> responde HTTP GET / para healthcheck
@@ -385,13 +395,20 @@ async def main():
     info(f"Iniciando WS+HTTP em ws://{PROXY_HOST}:{PROXY_PORT} (health GET /)")
     info(f"Redis alvo: {REDIS_HOST}:{REDIS_PORT}")
 
-    async with serve(ws_handler, PROXY_HOST, PROXY_PORT, process_request=process_request):
+    # max_size=None permite mensagens arbitrariamente grandes (logs longos)
+    async with serve(
+        ws_handler,
+        PROXY_HOST,
+        PROXY_PORT,
+        process_request=process_request,
+        max_size=None,
+    ):
         info("Servidor pronto. Aguardando conexões…")
         await asyncio.Future()
 
 if __name__ == "__main__":
     try:
-        # start redis if necessary
+        # start redis if necessary (opcional)
         start_local_redis()
 
         # run main server (websocket + http health)
