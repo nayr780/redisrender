@@ -72,7 +72,7 @@ else:
     REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_SSL = False
 
-# encoding used for 1:1 byte-preserving string<->bytes conversions
+# encoding used only for safe str->bytes when websockets gives str frames
 ENC = "latin-1"
 
 ###########################################################
@@ -244,8 +244,8 @@ async def ws_handler(ws: ServerConnection):
         if token != WS_AUTH_TOKEN:
             info(f"[WS] Token inválido: {token}")
             try:
-                # enviar texto (não bytes)
-                await ws.send("-NOAUTH Invalid token\r\n")
+                # enviar bytes (RESP style)
+                await ws.send(b"-NOAUTH Invalid token\r\n")
             except Exception:
                 pass
             await ws.close(code=4001)
@@ -262,8 +262,8 @@ async def ws_handler(ws: ServerConnection):
         msg = f"-ERR cannot connect to Redis backend {REDIS_HOST}:{REDIS_PORT}: {e}\r\n"
         info(f"[WS] {msg.strip()}")
         try:
-            # enviar texto (não bytes)
-            await ws.send(msg)
+            # enviar bytes (RESP style)
+            await ws.send(msg.encode("ascii", "replace"))
         except Exception:
             pass
         await ws.close(code=1011)
@@ -272,9 +272,9 @@ async def ws_handler(ws: ServerConnection):
     async def ws_to_redis():
         try:
             async for msg in ws:
-                # msg pode ser str ou bytes
+                # msg pode ser str (text frame) ou bytes (binary frame)
                 if isinstance(msg, str):
-                    data = msg.encode(ENC)
+                    data = msg.encode(ENC)   # latin-1 mantém 1:1 byte mapping se o cliente mandou bytes via text
                 else:
                     data = bytes(msg)
                 # escreve direto no redis backend (TCP)
@@ -285,6 +285,11 @@ async def ws_handler(ws: ServerConnection):
         finally:
             try:
                 redis_writer.close()
+                # wait_closed pode não existir dependendo da versão, tentar com cuidado
+                try:
+                    await redis_writer.wait_closed()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -309,8 +314,8 @@ async def ws_handler(ws: ServerConnection):
                     buf.extend(line)
 
                     if count is None:
-                        # fallback: envia o header como texto
-                        await ws.send(bytes(buf).decode(ENC))
+                        # fallback: envia o header como bytes
+                        await ws.send(bytes(buf))
                         continue
 
                     for _ in range(count):
@@ -330,8 +335,8 @@ async def ws_handler(ws: ServerConnection):
                                 chunk = await redis_reader.readexactly(ln + 2)
                                 buf.extend(chunk)
 
-                    # envia o array completo como string codificada latin-1
-                    await ws.send(bytes(buf).decode(ENC))
+                    # envia o array completo COMO BYTES (binary frame)
+                    await ws.send(bytes(buf))
                     continue
 
                 # BULK ($...)
@@ -347,7 +352,8 @@ async def ws_handler(ws: ServerConnection):
                         chunk = await redis_reader.readexactly(ln + 2)
                         buf.extend(chunk)
 
-                await ws.send(bytes(buf).decode(ENC))
+                # envia o token/bulk COMO BYTES
+                await ws.send(bytes(buf))
 
         except asyncio.IncompleteReadError:
             debug("[R→C] IncompleteReadError (connection closed)")
