@@ -1,38 +1,49 @@
-# main.py — Playwright + Flask (API genérica /do) com DEBUG pesado + auto-install + selftest
+# main.py — Playwright + Flask (controle remoto) com DEBUG pesado + multi-browser + FS tools + server logs
 #
-# Objetivo:
-# - Máxima flexibilidade: você manda JSON dizendo target/op/args/kwargs e pronto.
-# - Debugabilidade: endpoints de sysinfo/browsers/sessions/logs + traceback detalhado.
-# - Agilidade: auto-instala Chromium se faltar.
+# Segurança prática:
+# - Sem auth (como você pediu) = perigoso em público.
+# - Então eu implementei "travamento de filesystem": só deixa mexer dentro de /tmp e /opt/render/project/src.
+# - Sem execução de shell remota (pra não virar uma porta de ransomware acidental).
 #
-# IMPORTANTE (o bug que você pegou):
-# - Playwright SYNC (greenlet) NÃO pode ser usado atravessando threads.
-# - Então este servidor roda SEM threads: threaded=False e use_reloader=False.
-# - Isso resolve o "cannot switch to a different thread".
+# Playwright sync + greenlet:
+# - PRECISA rodar single-thread. Então: threaded=False e use_reloader=False
 #
-# Endpoints:
-#   GET  /              -> 200 (pra healthcheck/probe)
+# Endpoints principais:
+#   GET  /                      -> 200
 #   GET  /health
 #   GET  /sysinfo
-#   GET  /browsers
-#   GET  /sessions
-#   GET  /logs?sid=...
-#   POST /install       -> {"browser":"chromium|firefox|webkit"}  (default chromium)
-#   POST /ensure        -> {"browser":"chromium|firefox|webkit", "headless": true/false}
-#   POST /new           -> cria sessão
-#   POST /do            -> executa 1 step ou vários
-#   POST /close         -> {"sid":"..."}
-#   POST /stop
-#   POST /selftest      -> roda um teste completo e retorna resultado (inclusive screenshot b64)
+#   GET  /server_logs           -> logs do servidor (ring buffer)
+#   POST /server_logs/clear
 #
-# Modo cliente local (opcional):
-#   python main.py client http://127.0.0.1:5000
+# Browsers:
+#   POST /browser/new           -> cria browser {browser_id}
+#   GET  /browser/list          -> lista browsers
+#   POST /browser/close         -> fecha browser {browser_id}
+#   POST /ensure                -> garante browser default
+#   POST /install               -> instala browser (chromium/firefox/webkit)
+#
+# Sessions:
+#   POST /new                   -> cria sessão {sid} (aceita browser_id opcional)
+#   GET  /sessions
+#   GET  /logs?sid=...          -> logs da página (console/pageerror/requestfailed)
+#   POST /close                 -> fecha sessão
+#
+# Exec:
+#   POST /do                    -> step único ou steps
+#
+# Filesystem (restrito a roots seguros):
+#   GET  /fs/list?path=...&max=200
+#   GET  /fs/read?path=...&max_bytes=200000
+#   GET  /fs/stat?path=...
+#   POST /fs/write              -> {path, mode:"text|b64", content, append:bool}
+#   POST /fs/delete             -> {path}
+#
+# Selftest:
+#   POST /selftest              -> vai em example.com e retorna title + screenshot b64
 #
 # Requisitos:
-#   pip install flask playwright
-#
-# Observação:
-# - Isso é "expostão" de propósito, como você pediu. Se botar público, qualquer um controla um browser seu.
+#   flask
+#   playwright
 
 import os
 import sys
@@ -44,6 +55,7 @@ import signal
 import shutil
 import traceback
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -61,7 +73,7 @@ from playwright.sync_api import (
 APP = Flask(__name__)
 
 HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "5000"))  # se existir, usa; senão 5000.
+PORT = int(os.getenv("PORT", "5000"))
 
 BROWSERS_PATH = "/tmp/ms-playwright"
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
@@ -69,191 +81,31 @@ os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
 DEFAULT_TIMEOUT_MS = 30_000
 DEFAULT_HEADLESS = True
 
-# True = super flexível (chama métodos sem allowlist, bloqueando só dunder e close)
-UNSAFE_MODE = True
+# Sem auth (como você pediu). Mas ainda assim evitamos virar uma bomba acidental:
+SAFE_FS_ROOTS = [
+    "/tmp",
+    "/opt/render/project/src",
+]
 
-# allowlist (só usada se UNSAFE_MODE=False)
-ALLOWED = {
-    "browser": {"new_context", "version"},
-    "context": {
-        "new_page",
-        "add_cookies", "clear_cookies", "cookies",
-        "set_default_timeout", "set_default_navigation_timeout",
-        "storage_state",
-        "clear_permissions", "grant_permissions",
-        "set_extra_http_headers",
-    },
-    "page": {
-        "goto", "reload", "go_back", "go_forward",
-        "title", "content",
-        "click", "dblclick", "fill", "type", "press",
-        "check", "uncheck", "select_option",
-        "hover", "focus",
-        "wait_for_timeout", "wait_for_selector", "wait_for_load_state",
-        "evaluate", "eval_on_selector",
-        "set_viewport_size",
-        "set_extra_http_headers",
-        "screenshot",
-        "pdf",
-    },
-}
+# Ring buffer de logs do servidor (prints + exceptions + request log)
+SERVER_LOG_LIMIT = 600
 
-# ⚠️ SEM THREADS aqui. Playwright sync + greenlet precisa disso.
-# Como o Flask dev server vai rodar single-thread, o lock é mais para consistência.
-import threading
 _lock = threading.RLock()
 
 _pw: Optional[Playwright] = None
-_browser: Optional[Browser] = None
+
+# multi-browser
+BROWSERS: Dict[str, Browser] = {}  # browser_id -> Browser
+BROWSER_META: Dict[str, Dict[str, Any]] = {}  # browser_id -> info
 
 
 def _now() -> float:
     return time.time()
 
 
-def _json_body() -> Dict[str, Any]:
-    if request.is_json:
-        return request.get_json(silent=True) or {}
-    raw = (request.data or b"").decode("utf-8", errors="ignore").strip()
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {"_raw": raw}
-
-
-def _run(cmd: List[str], env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env or os.environ.copy(),
-    )
-
-
-def _ensure_dirs() -> None:
-    os.makedirs(BROWSERS_PATH, exist_ok=True)
-
-
-def _install(browser: str = "chromium") -> Dict[str, Any]:
-    _ensure_dirs()
-    env = os.environ.copy()
-    env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
-    cmd = [sys.executable, "-m", "playwright", "install", browser]
-    proc = _run(cmd, env=env)
-    return {
-        "ok": proc.returncode == 0,
-        "cmd": " ".join(cmd),
-        "returncode": proc.returncode,
-        "stdout_tail": proc.stdout[-4000:],
-        "stderr_tail": proc.stderr[-4000:],
-        "browsers_path": BROWSERS_PATH,
-        "python": sys.executable,
-    }
-
-
-def _start_playwright(headless: bool = DEFAULT_HEADLESS, browser: str = "chromium") -> Dict[str, Any]:
-    """Sobe Playwright + Browser; se faltar executável, instala e tenta de novo."""
-    global _pw, _browser
-    with _lock:
-        if _pw and _browser:
-            return {"ok": True, "status": "already_running", "browser": browser}
-
-        _ensure_dirs()
-        _pw = sync_playwright().start()
-
-        def _launch() -> Browser:
-            if browser == "chromium":
-                return _pw.chromium.launch(
-                    headless=headless,
-                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-                )
-            if browser == "firefox":
-                return _pw.firefox.launch(headless=headless)
-            if browser == "webkit":
-                return _pw.webkit.launch(headless=headless)
-            raise ValueError("browser must be chromium|firefox|webkit")
-
-        try:
-            _browser = _launch()
-            exe = None
-            try:
-                exe = getattr(getattr(_pw, browser), "executable_path", None)
-            except Exception:
-                exe = None
-            return {
-                "ok": True,
-                "status": "started",
-                "headless": headless,
-                "browser": browser,
-                "browsers_path": BROWSERS_PATH,
-                "python": sys.executable,
-                "executable_path": exe,
-            }
-        except PWError:
-            inst = _install(browser=browser)
-            try:
-                _browser = _launch()
-                exe = None
-                try:
-                    exe = getattr(getattr(_pw, browser), "executable_path", None)
-                except Exception:
-                    exe = None
-                return {
-                    "ok": True,
-                    "status": "started_after_install",
-                    "headless": headless,
-                    "browser": browser,
-                    "install": inst,
-                    "browsers_path": BROWSERS_PATH,
-                    "python": sys.executable,
-                    "executable_path": exe,
-                }
-            except PWError as e2:
-                _stop_all_noexcept()
-                return {
-                    "ok": False,
-                    "status": "failed_to_start",
-                    "browser": browser,
-                    "error": str(e2),
-                    "install": inst,
-                }
-
-
-def _stop_all_noexcept() -> None:
-    global _pw, _browser, SESSIONS
-    with _lock:
-        try:
-            for sid in list(SESSIONS.keys()):
-                try:
-                    SESSIONS[sid].close()
-                except Exception:
-                    pass
-                SESSIONS.pop(sid, None)
-        except Exception:
-            pass
-
-        try:
-            if _browser:
-                _browser.close()
-        except Exception:
-            pass
-        _browser = None
-
-        try:
-            if _pw:
-                _pw.stop()
-        except Exception:
-            pass
-        _pw = None
-
-
-def _new_sid() -> str:
-    return base64.urlsafe_b64encode(os.urandom(18)).decode("utf-8").rstrip("=")
-
-
+# ---------------------------
+# Server logs (ring buffer)
+# ---------------------------
 @dataclass
 class RingLog:
     limit: int = 400
@@ -267,16 +119,299 @@ class RingLog:
     def dump(self) -> List[Dict[str, Any]]:
         return list(self.items)
 
+    def clear(self) -> None:
+        self.items.clear()
+
+
+SERVER_LOG = RingLog(limit=SERVER_LOG_LIMIT)
+
+
+def slog(kind: str, **data):
+    """Log pro ring buffer + stdout (pra você ver no Render log)."""
+    try:
+        SERVER_LOG.add(kind, data)
+    except Exception:
+        pass
+    try:
+        # print “bonito” no stdout
+        msg = f"[{kind}] " + " ".join([f"{k}={repr(v)}" for k, v in data.items()])
+        print(msg, flush=True)
+    except Exception:
+        pass
+
+
+@APP.before_request
+def _log_request():
+    slog("http_in", method=request.method, path=request.path, ip=request.remote_addr)
+
+
+@APP.after_request
+def _log_response(resp):
+    slog("http_out", method=request.method, path=request.path, status=resp.status_code)
+    return resp
+
+
+@APP.errorhandler(Exception)
+def _handle_exception(e: Exception):
+    tb = traceback.format_exc(limit=20)
+    slog("exception", error=str(e), traceback=tb)
+    return jsonify({"ok": False, "error": str(e), "traceback": tb}), 500
+
+
+# ---------------------------
+# JSON parsing
+# ---------------------------
+def _json_body() -> Dict[str, Any]:
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    raw = (request.data or b"").decode("utf-8", errors="ignore").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"_raw": raw}
+
+
+# ---------------------------
+# Filesystem helpers (SAFE)
+# ---------------------------
+def _is_under_roots(abs_path: str) -> bool:
+    abs_path = os.path.abspath(abs_path)
+    for root in SAFE_FS_ROOTS:
+        root_abs = os.path.abspath(root)
+        if abs_path == root_abs or abs_path.startswith(root_abs + os.sep):
+            return True
+    return False
+
+
+def _safe_path(p: str) -> str:
+    if not isinstance(p, str) or not p.strip():
+        raise ValueError("invalid_path")
+    ap = os.path.abspath(p)
+    if not _is_under_roots(ap):
+        raise ValueError("path_outside_allowed_roots")
+    return ap
+
+
+def _fs_list(path: str, max_items: int = 200) -> Dict[str, Any]:
+    ap = _safe_path(path)
+    if not os.path.isdir(ap):
+        raise ValueError("not_a_directory")
+    items = []
+    for name in sorted(os.listdir(ap))[: max_items]:
+        full = os.path.join(ap, name)
+        try:
+            st = os.stat(full)
+            items.append({
+                "name": name,
+                "path": full,
+                "is_dir": os.path.isdir(full),
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+        except Exception as e:
+            items.append({"name": name, "path": full, "error": str(e)})
+    return {"path": ap, "items": items}
+
+
+def _fs_read(path: str, max_bytes: int = 200_000) -> Dict[str, Any]:
+    ap = _safe_path(path)
+    if not os.path.isfile(ap):
+        raise ValueError("not_a_file")
+    with open(ap, "rb") as f:
+        data = f.read(max_bytes)
+    # tenta decode como texto (pra debug rápido)
+    try:
+        text = data.decode("utf-8")
+        return {"path": ap, "mode": "text", "text": text, "bytes": len(data)}
+    except Exception:
+        return {"path": ap, "mode": "b64", "b64": base64.b64encode(data).decode("utf-8"), "bytes": len(data)}
+
+
+def _fs_stat(path: str) -> Dict[str, Any]:
+    ap = _safe_path(path)
+    st = os.stat(ap)
+    return {
+        "path": ap,
+        "is_dir": os.path.isdir(ap),
+        "is_file": os.path.isfile(ap),
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+        "mode": st.st_mode,
+    }
+
+
+def _fs_write(path: str, mode: str, content: str, append: bool = False) -> Dict[str, Any]:
+    ap = _safe_path(path)
+    os.makedirs(os.path.dirname(ap), exist_ok=True)
+
+    if mode == "text":
+        data = content.encode("utf-8")
+    elif mode == "b64":
+        data = base64.b64decode(content.encode("utf-8"))
+    else:
+        raise ValueError("mode_must_be_text_or_b64")
+
+    file_mode = "ab" if append else "wb"
+    with open(ap, file_mode) as f:
+        f.write(data)
+    return {"path": ap, "bytes_written": len(data), "append": append}
+
+
+def _fs_delete(path: str) -> Dict[str, Any]:
+    ap = _safe_path(path)
+    if os.path.isdir(ap):
+        # pra evitar apagar pasta inteira sem querer, exige vazio
+        if os.listdir(ap):
+            raise ValueError("directory_not_empty")
+        os.rmdir(ap)
+        return {"path": ap, "deleted": True, "type": "dir"}
+    if os.path.isfile(ap):
+        os.remove(ap)
+        return {"path": ap, "deleted": True, "type": "file"}
+    raise ValueError("path_not_found")
+
+
+# ---------------------------
+# Playwright / Browser management
+# ---------------------------
+def _ensure_dirs():
+    os.makedirs(BROWSERS_PATH, exist_ok=True)
+
+
+def _run(cmd: List[str], env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env or os.environ.copy(),
+    )
+
+
+def _install(browser: str = "chromium") -> Dict[str, Any]:
+    _ensure_dirs()
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
+    cmd = [sys.executable, "-m", "playwright", "install", browser]
+    proc = _run(cmd, env=env)
+    slog("install", cmd=" ".join(cmd), returncode=proc.returncode)
+    return {
+        "ok": proc.returncode == 0,
+        "cmd": " ".join(cmd),
+        "returncode": proc.returncode,
+        "stdout_tail": proc.stdout[-4000:],
+        "stderr_tail": proc.stderr[-4000:],
+        "browsers_path": BROWSERS_PATH,
+        "python": sys.executable,
+    }
+
+
+def _ensure_pw_started() -> None:
+    global _pw
+    if _pw is None:
+        _ensure_dirs()
+        _pw = sync_playwright().start()
+        slog("pw_start", ok=True)
+
+
+def _launch_browser(browser: str, headless: bool) -> Browser:
+    _ensure_pw_started()
+
+    if browser == "chromium":
+        return _pw.chromium.launch(
+            headless=headless,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+    if browser == "firefox":
+        return _pw.firefox.launch(headless=headless)
+    if browser == "webkit":
+        return _pw.webkit.launch(headless=headless)
+    raise ValueError("browser must be chromium|firefox|webkit")
+
+
+def _browser_new(browser: str = "chromium", headless: bool = DEFAULT_HEADLESS, browser_id: Optional[str] = None) -> Dict[str, Any]:
+    with _lock:
+        _ensure_pw_started()
+        if not browser_id:
+            browser_id = base64.urlsafe_b64encode(os.urandom(10)).decode("utf-8").rstrip("=")
+
+        if browser_id in BROWSERS:
+            raise ValueError("browser_id_already_exists")
+
+        try:
+            b = _launch_browser(browser=browser, headless=headless)
+        except PWError as e:
+            # tenta instalar e relançar
+            inst = _install(browser=browser)
+            if not inst["ok"]:
+                raise RuntimeError(f"install_failed: {inst['stderr_tail']}")
+            b = _launch_browser(browser=browser, headless=headless)
+
+        BROWSERS[browser_id] = b
+        BROWSER_META[browser_id] = {
+            "browser": browser,
+            "headless": headless,
+            "created_at": _now(),
+        }
+        slog("browser_new", browser_id=browser_id, browser=browser, headless=headless)
+        return {"ok": True, "browser_id": browser_id, **BROWSER_META[browser_id]}
+
+
+def _browser_get(browser_id: str) -> Browser:
+    b = BROWSERS.get(browser_id)
+    if not b:
+        raise KeyError("browser_not_found")
+    return b
+
+
+def _browser_close(browser_id: str) -> Dict[str, Any]:
+    with _lock:
+        b = _browser_get(browser_id)
+        try:
+            b.close()
+        finally:
+            BROWSERS.pop(browser_id, None)
+            meta = BROWSER_META.pop(browser_id, None) or {}
+        slog("browser_close", browser_id=browser_id)
+        return {"ok": True, "browser_id": browser_id, "meta": meta}
+
+
+def _browser_list() -> List[Dict[str, Any]]:
+    out = []
+    for bid, meta in BROWSER_META.items():
+        out.append({
+            "browser_id": bid,
+            **meta,
+            "alive": bid in BROWSERS,
+        })
+    return out
+
+
+def _ensure_default_browser(headless: bool, browser: str) -> Dict[str, Any]:
+    # default browser_id = "default"
+    with _lock:
+        if "default" in BROWSERS:
+            return {"ok": True, "status": "already_running", "browser_id": "default", **BROWSER_META.get("default", {})}
+        return _browser_new(browser=browser, headless=headless, browser_id="default")
+
+
+# ---------------------------
+# Sessions + page logs
+# ---------------------------
+def _new_sid() -> str:
+    return base64.urlsafe_b64encode(os.urandom(18)).decode("utf-8").rstrip("=")
+
 
 @dataclass
 class Session:
     sid: str
+    browser_id: str
     context: BrowserContext
     page: Page
     created_at: float
-    headless: bool
-    browser_name: str
-    log: RingLog = field(default_factory=RingLog)
+    log: RingLog = field(default_factory=lambda: RingLog(limit=500))
 
     def close(self) -> None:
         self.context.close()
@@ -318,19 +453,29 @@ def _get_sess(sid: str) -> Session:
     return s
 
 
-def _get_target(sid: str, t: str) -> Any:
-    if t == "browser":
-        if not _browser:
-            raise RuntimeError("browser_not_started")
-        return _browser
-    s = _get_sess(sid)
-    if t == "context":
-        return s.context
-    if t == "page":
-        return s.page
-    raise ValueError("target must be page|context|browser")
+def _summarize_session(s: Session) -> Dict[str, Any]:
+    try:
+        url = s.page.url
+    except Exception:
+        url = None
+    try:
+        title = s.page.title()
+    except Exception:
+        title = None
+    return {
+        "sid": s.sid,
+        "browser_id": s.browser_id,
+        "created_at": s.created_at,
+        "age_s": round(_now() - s.created_at, 3),
+        "url": url,
+        "title": title,
+        "log_items": len(s.log.items),
+    }
 
 
+# ---------------------------
+# /do execution engine
+# ---------------------------
 def _is_safe_op(op: str) -> bool:
     if op.startswith("__"):
         return False
@@ -339,20 +484,38 @@ def _is_safe_op(op: str) -> bool:
     return True
 
 
-def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any], ret_mode: str) -> Any:
+def _jsonable(x: Any) -> Any:
+    """Tenta tornar retorno serializável."""
+    try:
+        json.dumps(x)
+        return x
+    except Exception:
+        return str(x)
+
+
+def _get_target(sid: str, t: str, browser_id: Optional[str]) -> Any:
+    if t == "browser":
+        bid = browser_id or "default"
+        return _browser_get(bid)
+
+    s = _get_sess(sid)
+    if t == "context":
+        return s.context
+    if t == "page":
+        return s.page
+    raise ValueError("target must be page|context|browser")
+
+
+def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any], ret_mode: str, browser_id: Optional[str]) -> Any:
     if not _is_safe_op(op):
         raise ValueError("op_blocked")
 
-    if not UNSAFE_MODE:
-        if op not in ALLOWED.get(t, set()):
-            raise ValueError(f"op_not_allowed: {t}.{op}")
-
-    obj = _get_target(sid, t)
+    obj = _get_target(sid=sid, t=t, browser_id=browser_id)
     fn = getattr(obj, op, None)
     if fn is None or not callable(fn):
         raise ValueError(f"no_such_callable: {t}.{op}")
 
-    # timeouts default onde ajuda
+    # timeouts default
     if t == "page" and op in {"goto", "click", "dblclick", "fill", "type", "press", "hover", "focus", "wait_for_selector"}:
         kwargs = dict(kwargs)
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT_MS)
@@ -367,35 +530,12 @@ def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any],
     if ret_mode == "str":
         return str(result)
 
-    # json
-    try:
-        json.dumps(result)
-        return result
-    except Exception:
-        return str(result)
+    return _jsonable(result)
 
 
-def _summarize_session(s: Session) -> Dict[str, Any]:
-    try:
-        url = s.page.url
-    except Exception:
-        url = None
-    try:
-        title = s.page.title()
-    except Exception:
-        title = None
-    return {
-        "sid": s.sid,
-        "created_at": s.created_at,
-        "age_s": round(_now() - s.created_at, 3),
-        "headless": s.headless,
-        "browser": s.browser_name,
-        "url": url,
-        "title": title,
-        "log_items": len(s.log.items),
-    }
-
-
+# ---------------------------
+# Sysinfo helpers
+# ---------------------------
 def _disk_info(path: str = "/") -> Dict[str, Any]:
     try:
         u = shutil.disk_usage(path)
@@ -421,83 +561,163 @@ def _cgroup_hints() -> Dict[str, Any]:
         out["cpu.max"] = cpu_max.strip()
     if mem_max:
         out["memory.max"] = mem_max.strip()
-
-    cpu_quota = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-    cpu_period = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-    mem_limit = _read_text("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-    if cpu_quota:
-        out["cpu.cfs_quota_us"] = cpu_quota.strip()
-    if cpu_period:
-        out["cpu.cfs_period_us"] = cpu_period.strip()
-    if mem_limit:
-        out["memory.limit_in_bytes"] = mem_limit.strip()
     return out
 
 
-def _list_tree(root: str, max_depth: int = 4, max_items: int = 400) -> List[str]:
-    res: List[str] = []
-    root = os.path.abspath(root)
-    for base, dirs, files in os.walk(root):
-        depth = base[len(root):].count(os.sep)
-        if depth > max_depth:
-            dirs[:] = []
-            continue
-        for name in sorted(dirs + files):
-            res.append(os.path.join(base, name))
-            if len(res) >= max_items:
-                return res
-    return res
-
-
+# ---------------------------
+# Routes
+# ---------------------------
 @APP.get("/")
 def root():
-    # evita 404 no healthcheck/probe da plataforma
-    return jsonify({"ok": True, "hint": "use /health, /new, /do, /selftest"})
+    return jsonify({"ok": True, "hint": "use /health /sysinfo /server_logs /browser/list /new /do /sessions /logs"})
 
 
 @APP.get("/health")
 def health():
-    return jsonify(
-        {
-            "ok": True,
-            "time": _now(),
-            "port": PORT,
-            "python_executable": sys.executable,
-            "cwd": os.getcwd(),
-            "browsers_path": BROWSERS_PATH,
-            "running": bool(_pw and _browser),
-            "sessions": len(SESSIONS),
-            "unsafe_mode": UNSAFE_MODE,
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "time": _now(),
+        "port": PORT,
+        "python_executable": sys.executable,
+        "cwd": os.getcwd(),
+        "browsers_path": BROWSERS_PATH,
+        "pw_running": _pw is not None,
+        "browsers": len(BROWSERS),
+        "sessions": len(SESSIONS),
+        "safe_fs_roots": SAFE_FS_ROOTS,
+    })
 
 
 @APP.get("/sysinfo")
 def sysinfo():
-    return jsonify(
-        {
-            "ok": True,
-            "time": _now(),
-            "python_executable": sys.executable,
-            "python_version": sys.version,
-            "cwd": os.getcwd(),
-            "pid": os.getpid(),
-            "disk_root": _disk_info("/"),
-            "disk_tmp": _disk_info("/tmp"),
-            "cgroup": _cgroup_hints(),
-            "browsers_path_exists": os.path.exists(BROWSERS_PATH),
-            "browsers_path_list_sample": (os.listdir(BROWSERS_PATH)[:80] if os.path.isdir(BROWSERS_PATH) else []),
-            "env_keys_sample": sorted(list(os.environ.keys()))[:80],
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "time": _now(),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "cwd": os.getcwd(),
+        "pid": os.getpid(),
+        "disk_root": _disk_info("/"),
+        "disk_tmp": _disk_info("/tmp"),
+        "cgroup": _cgroup_hints(),
+        "env_keys_sample": sorted(list(os.environ.keys()))[:100],
+        "browsers_path_exists": os.path.exists(BROWSERS_PATH),
+        "browsers_path_list_sample": (os.listdir(BROWSERS_PATH)[:80] if os.path.isdir(BROWSERS_PATH) else []),
+    })
 
 
-@APP.get("/browsers")
-def browsers():
-    if not os.path.isdir(BROWSERS_PATH):
-        return jsonify({"ok": True, "exists": False, "path": BROWSERS_PATH, "tree": []})
-    tree = _list_tree(BROWSERS_PATH, max_depth=5, max_items=600)
-    return jsonify({"ok": True, "exists": True, "path": BROWSERS_PATH, "tree": tree})
+@APP.get("/server_logs")
+def server_logs():
+    # pode passar ?tail=100
+    try:
+        tail = int(request.args.get("tail", "200"))
+    except Exception:
+        tail = 200
+    logs = SERVER_LOG.dump()
+    if tail > 0:
+        logs = logs[-tail:]
+    return jsonify({"ok": True, "count": len(SERVER_LOG.items), "tail": tail, "logs": logs})
+
+
+@APP.post("/server_logs/clear")
+def server_logs_clear():
+    SERVER_LOG.clear()
+    return jsonify({"ok": True})
+
+
+# ---- Browsers ----
+@APP.post("/install")
+def install():
+    body = _json_body()
+    browser = body.get("browser", "chromium")
+    res = _install(browser=browser)
+    return jsonify(res), (200 if res["ok"] else 500)
+
+
+@APP.post("/ensure")
+def ensure():
+    body = _json_body()
+    headless = bool(body.get("headless", DEFAULT_HEADLESS))
+    browser = body.get("browser", "chromium")
+    res = _ensure_default_browser(headless=headless, browser=browser)
+    return jsonify(res), (200 if res.get("ok") else 500)
+
+
+@APP.post("/browser/new")
+def browser_new():
+    body = _json_body()
+    browser = body.get("browser", "chromium")
+    headless = bool(body.get("headless", DEFAULT_HEADLESS))
+    browser_id = body.get("browser_id")
+    res = _browser_new(browser=browser, headless=headless, browser_id=browser_id)
+    return jsonify(res)
+
+
+@APP.get("/browser/list")
+def browser_list():
+    return jsonify({"ok": True, "browsers": _browser_list()})
+
+
+@APP.post("/browser/close")
+def browser_close():
+    body = _json_body()
+    browser_id = body.get("browser_id")
+    if not browser_id:
+        return jsonify({"ok": False, "error": "missing browser_id"}), 400
+    res = _browser_close(browser_id=browser_id)
+    return jsonify(res)
+
+
+# ---- Sessions ----
+@APP.post("/new")
+def new():
+    body = _json_body()
+    # escolhe browser
+    browser_id = body.get("browser_id", "default")
+    headless = bool(body.get("headless", DEFAULT_HEADLESS))
+    browser_name = body.get("browser", "chromium")
+
+    # garante default se pediram default
+    if browser_id == "default" and "default" not in BROWSERS:
+        _ensure_default_browser(headless=headless, browser=browser_name)
+
+    with _lock:
+        sid = _new_sid()
+        b = _browser_get(browser_id)
+
+        ctx_kwargs: Dict[str, Any] = {}
+
+        viewport = body.get("viewport")
+        if isinstance(viewport, dict) and "width" in viewport and "height" in viewport:
+            ctx_kwargs["viewport"] = viewport
+        if isinstance(body.get("user_agent"), str):
+            ctx_kwargs["user_agent"] = body["user_agent"]
+        if isinstance(body.get("locale"), str):
+            ctx_kwargs["locale"] = body["locale"]
+        if isinstance(body.get("timezone_id"), str):
+            ctx_kwargs["timezone_id"] = body["timezone_id"]
+        if isinstance(body.get("ignore_https_errors"), bool):
+            ctx_kwargs["ignore_https_errors"] = body["ignore_https_errors"]
+
+        context = b.new_context(**ctx_kwargs)
+        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        context.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
+
+        page = context.new_page()
+
+        sess = Session(
+            sid=sid,
+            browser_id=browser_id,
+            context=context,
+            page=page,
+            created_at=_now(),
+        )
+        _attach_listeners(sess)
+        SESSIONS[sid] = sess
+
+        slog("session_new", sid=sid, browser_id=browser_id)
+
+    return jsonify({"ok": True, "sid": sid, "session": _summarize_session(sess), "browser_id": browser_id})
 
 
 @APP.get("/sessions")
@@ -512,74 +732,16 @@ def logs():
     if not sid:
         return jsonify({"ok": False, "error": "missing sid query param"}), 400
     with _lock:
+        s = _get_sess(sid)
+        # tail opcional
         try:
-            s = _get_sess(sid)
-        except KeyError:
-            return jsonify({"ok": False, "error": "session_not_found"}), 404
-        return jsonify({"ok": True, "sid": sid, "logs": s.log.dump()})
-
-
-@APP.post("/install")
-def install():
-    body = _json_body()
-    browser = body.get("browser", "chromium")
-    res = _install(browser=browser)
-    return jsonify(res), (200 if res["ok"] else 500)
-
-
-@APP.post("/ensure")
-def ensure():
-    body = _json_body()
-    headless = bool(body.get("headless", DEFAULT_HEADLESS))
-    browser = body.get("browser", "chromium")
-    res = _start_playwright(headless=headless, browser=browser)
-    return jsonify(res), (200 if res.get("ok") else 500)
-
-
-@APP.post("/new")
-def new():
-    body = _json_body()
-    headless = bool(body.get("headless", DEFAULT_HEADLESS))
-    browser = body.get("browser", "chromium")
-
-    res = _start_playwright(headless=headless, browser=browser)
-    if not res.get("ok"):
-        return jsonify(res), 500
-
-    with _lock:
-        sid = _new_sid()
-
-        ctx_kwargs: Dict[str, Any] = {}
-        viewport = body.get("viewport")
-        if isinstance(viewport, dict) and "width" in viewport and "height" in viewport:
-            ctx_kwargs["viewport"] = viewport
-
-        if isinstance(body.get("user_agent"), str):
-            ctx_kwargs["user_agent"] = body["user_agent"]
-        if isinstance(body.get("locale"), str):
-            ctx_kwargs["locale"] = body["locale"]
-        if isinstance(body.get("timezone_id"), str):
-            ctx_kwargs["timezone_id"] = body["timezone_id"]
-        if isinstance(body.get("ignore_https_errors"), bool):
-            ctx_kwargs["ignore_https_errors"] = body["ignore_https_errors"]
-
-        context = _browser.new_context(**ctx_kwargs)  # type: ignore
-        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
-        context.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
-        page = context.new_page()
-
-        sess = Session(
-            sid=sid,
-            context=context,
-            page=page,
-            created_at=_now(),
-            headless=headless,
-            browser_name=browser,
-        )
-        _attach_listeners(sess)
-        SESSIONS[sid] = sess
-
-    return jsonify({"ok": True, "sid": sid, "session": _summarize_session(sess), "ensure": res})
+            tail = int(request.args.get("tail", "200"))
+        except Exception:
+            tail = 200
+        items = s.log.dump()
+        if tail > 0:
+            items = items[-tail:]
+        return jsonify({"ok": True, "sid": sid, "count": len(s.log.items), "tail": tail, "logs": items})
 
 
 @APP.post("/close")
@@ -597,13 +759,41 @@ def close():
             sess.close()
         finally:
             SESSIONS.pop(sid, None)
+        slog("session_close", sid=sid)
 
     return jsonify({"ok": True, "closed": sid})
 
 
 @APP.post("/stop")
 def stop():
-    _stop_all_noexcept()
+    with _lock:
+        # fecha sessões
+        for sid in list(SESSIONS.keys()):
+            try:
+                SESSIONS[sid].close()
+            except Exception:
+                pass
+            SESSIONS.pop(sid, None)
+
+        # fecha browsers
+        for bid in list(BROWSERS.keys()):
+            try:
+                BROWSERS[bid].close()
+            except Exception:
+                pass
+            BROWSERS.pop(bid, None)
+            BROWSER_META.pop(bid, None)
+
+        # fecha PW
+        global _pw
+        try:
+            if _pw:
+                _pw.stop()
+        except Exception:
+            pass
+        _pw = None
+
+    slog("stop_all")
     return jsonify({"ok": True, "status": "stopped"})
 
 
@@ -612,16 +802,22 @@ def do():
     """
     API flexível:
       - single:
-        {"sid":"...","t":"page|context|browser","op":"goto","args":[...],"kwargs":{...},"return":"json|str|b64"}
+        {"sid":"...","t":"page|context|browser","op":"goto","args":[...],"kwargs":{...},"return":"json|str|b64","browser_id":"..."}
       - multi:
         {"sid":"...","steps":[{...},{...}]}
 
-    Regras:
-      - "sid" pode ficar no topo e também dentro de step. Se step não tiver sid, usa o sid do topo.
-      - Retorna traceback curto no erro.
+    Extras:
+      - step pode trazer browser_id (pra target=browser)
+      - retorna dt_ms e traceback em erro
     """
     body = _json_body()
     top_sid = (body.get("sid") or "").strip()
+    steps = body.get("steps")
+
+    if steps is None:
+        steps = [body]
+    if not isinstance(steps, list) or not steps:
+        return jsonify({"ok": False, "error": "steps must be a non-empty list"}), 400
 
     def exec_step(step: Dict[str, Any]) -> Dict[str, Any]:
         t0 = _now()
@@ -631,11 +827,12 @@ def do():
         args = step.get("args", [])
         kwargs = step.get("kwargs", {})
         ret_mode = str(step.get("return", "json")).strip().lower()
+        browser_id = step.get("browser_id")
 
-        if not sid and t != "browser":
-            raise ValueError("missing sid")
         if not op:
             raise ValueError("missing op")
+        if t != "browser" and not sid:
+            raise ValueError("missing sid")
         if not isinstance(args, list):
             raise ValueError("args must be a list")
         if not isinstance(kwargs, dict):
@@ -643,7 +840,7 @@ def do():
         if ret_mode not in {"json", "str", "b64"}:
             raise ValueError("return must be json|str|b64")
 
-        result = _call_op(sid, t, op, args, kwargs, ret_mode)
+        result = _call_op(sid=sid, t=t, op=op, args=args, kwargs=kwargs, ret_mode=ret_mode, browser_id=browser_id)
         return {
             "ok": True,
             "sid": sid,
@@ -653,12 +850,6 @@ def do():
             "result": result,
         }
 
-    steps = body.get("steps")
-    if steps is None:
-        steps = [body]
-    if not isinstance(steps, list) or not steps:
-        return jsonify({"ok": False, "error": "steps must be a non-empty list"}), 400
-
     out: List[Dict[str, Any]] = []
     with _lock:
         for i, step in enumerate(steps):
@@ -667,96 +858,146 @@ def do():
             try:
                 out.append(exec_step(step))
             except Exception as e:
-                out.append(
-                    {
-                        "ok": False,
-                        "step_index": i,
-                        "error": str(e),
-                        "traceback": traceback.format_exc(limit=10),
-                        "step": step,
-                    }
-                )
+                out.append({
+                    "ok": False,
+                    "step_index": i,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(limit=15),
+                    "step": step,
+                })
                 break
 
     ok = all(x.get("ok") for x in out)
     return jsonify({"ok": ok, "results": out}), (200 if ok else 500)
 
 
+# ---- Filesystem endpoints ----
+@APP.get("/fs/list")
+def fs_list():
+    path = request.args.get("path", "/opt/render/project/src")
+    try:
+        max_items = int(request.args.get("max", "200"))
+    except Exception:
+        max_items = 200
+    res = _fs_list(path=path, max_items=max_items)
+    return jsonify({"ok": True, **res})
+
+
+@APP.get("/fs/read")
+def fs_read():
+    path = request.args.get("path", "")
+    if not path:
+        return jsonify({"ok": False, "error": "missing path"}), 400
+    try:
+        max_bytes = int(request.args.get("max_bytes", "200000"))
+    except Exception:
+        max_bytes = 200_000
+    res = _fs_read(path=path, max_bytes=max_bytes)
+    return jsonify({"ok": True, **res})
+
+
+@APP.get("/fs/stat")
+def fs_stat():
+    path = request.args.get("path", "")
+    if not path:
+        return jsonify({"ok": False, "error": "missing path"}), 400
+    res = _fs_stat(path=path)
+    return jsonify({"ok": True, **res})
+
+
+@APP.post("/fs/write")
+def fs_write():
+    body = _json_body()
+    path = body.get("path", "")
+    mode = body.get("mode", "text")
+    content = body.get("content", "")
+    append = bool(body.get("append", False))
+    if not path:
+        return jsonify({"ok": False, "error": "missing path"}), 400
+    if not isinstance(content, str):
+        return jsonify({"ok": False, "error": "content must be string"}), 400
+    res = _fs_write(path=path, mode=mode, content=content, append=append)
+    return jsonify({"ok": True, **res})
+
+
+@APP.post("/fs/delete")
+def fs_delete():
+    body = _json_body()
+    path = body.get("path", "")
+    if not path:
+        return jsonify({"ok": False, "error": "missing path"}), 400
+    res = _fs_delete(path=path)
+    return jsonify({"ok": True, **res})
+
+
+# ---- Selftest ----
 @APP.post("/selftest")
 def selftest():
-    """
-    Roda um teste completo no próprio runtime:
-      - ensure chromium
-      - new session
-      - goto example.com
-      - title
-      - screenshot b64
-      - close session
-    """
     body = _json_body()
-    browser = body.get("browser", "chromium")
-    headless = bool(body.get("headless", True))
     url = body.get("url", "https://example.com")
+    headless = bool(body.get("headless", True))
+    browser_name = body.get("browser", "chromium")
 
-    ensure_res = _start_playwright(headless=headless, browser=browser)
-    if not ensure_res.get("ok"):
-        return jsonify({"ok": False, "stage": "ensure", "ensure": ensure_res}), 500
+    # usa browser default
+    _ensure_default_browser(headless=headless, browser=browser_name)
 
     sid = None
-    try:
-        with _lock:
-            sid = _new_sid()
-            context = _browser.new_context()  # type: ignore
-            context.set_default_timeout(DEFAULT_TIMEOUT_MS)
-            context.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
-            page = context.new_page()
+    with _lock:
+        sid = _new_sid()
+        b = _browser_get("default")
+        ctx = b.new_context()
+        ctx.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        ctx.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
+        page = ctx.new_page()
 
-            sess = Session(
-                sid=sid,
-                context=context,
-                page=page,
-                created_at=_now(),
-                headless=headless,
-                browser_name=browser,
-            )
-            _attach_listeners(sess)
-            SESSIONS[sid] = sess
+        sess = Session(sid=sid, browser_id="default", context=ctx, page=page, created_at=_now())
+        _attach_listeners(sess)
 
+        try:
             page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
             title = page.title()
             shot = page.screenshot(full_page=True)
             shot_b64 = base64.b64encode(shot).decode("utf-8")
+            logs_tail = sess.log.dump()[-50:]
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
 
-            logs_dump = sess.log.dump()[-50:]
+    return jsonify({"ok": True, "url": url, "title": title, "screenshot_b64": shot_b64, "logs_tail": logs_tail})
 
-            sess.close()
-            SESSIONS.pop(sid, None)
 
-        return jsonify(
-            {
-                "ok": True,
-                "ensure": ensure_res,
-                "url": url,
-                "title": title,
-                "screenshot_b64": shot_b64,
-                "logs_tail": logs_dump,
-            }
-        )
-    except Exception as e:
-        tb = traceback.format_exc(limit=12)
-        # cleanup best-effort
+# ---------------------------
+# shutdown hooks
+# ---------------------------
+def _on_exit(*_args):
+    try:
         with _lock:
-            if sid and sid in SESSIONS:
+            for sid in list(SESSIONS.keys()):
                 try:
                     SESSIONS[sid].close()
                 except Exception:
                     pass
                 SESSIONS.pop(sid, None)
-        return jsonify({"ok": False, "stage": "run", "error": str(e), "traceback": tb}), 500
 
+            for bid in list(BROWSERS.keys()):
+                try:
+                    BROWSERS[bid].close()
+                except Exception:
+                    pass
+                BROWSERS.pop(bid, None)
+                BROWSER_META.pop(bid, None)
 
-def _on_exit(*_args):
-    _stop_all_noexcept()
+            global _pw
+            if _pw:
+                try:
+                    _pw.stop()
+                except Exception:
+                    pass
+            _pw = None
+    except Exception:
+        pass
 
 
 atexit.register(_on_exit)
@@ -764,52 +1005,7 @@ signal.signal(signal.SIGTERM, _on_exit)
 signal.signal(signal.SIGINT, _on_exit)
 
 
-# ----------------------------
-# Client mode (pra testar do seu PC)
-# ----------------------------
-def _http_json(url: str, payload: Optional[Dict[str, Any]] = None, method: str = "POST") -> Tuple[int, Dict[str, Any]]:
-    import urllib.request
-
-    data = None
-    headers = {"Content-Type": "application/json"}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            code = resp.getcode()
-            body = resp.read().decode("utf-8", errors="ignore")
-            try:
-                return code, json.loads(body)
-            except Exception:
-                return code, {"_raw": body}
-    except Exception as e:
-        return 0, {"ok": False, "error": str(e)}
-
-
-def client_demo(base: str):
-    print("== client demo ==")
-    c, h = _http_json(base + "/health", None, method="GET")
-    print("health:", c, h)
-
-    c, st = _http_json(base + "/selftest", {"browser": "chromium", "headless": True, "url": "https://example.com"})
-    print("selftest:", c, {"ok": st.get("ok"), "title": st.get("title")})
-
-    # salva screenshot local (se vier)
-    if st.get("ok") and st.get("screenshot_b64"):
-        try:
-            img = base64.b64decode(st["screenshot_b64"])
-            with open("selftest.png", "wb") as f:
-                f.write(img)
-            print("saved selftest.png")
-        except Exception as e:
-            print("failed saving image:", e)
-
-
 if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1].lower() == "client":
-        base = sys.argv[2] if len(sys.argv) >= 3 else f"http://127.0.0.1:{PORT}"
-        client_demo(base)
-    else:
-        # ✅ CRÍTICO: SEM threads e SEM reloader (senão dá greenlet/thread crash)
-        APP.run(host=HOST, port=PORT, threaded=False, use_reloader=False)
+    slog("boot", port=PORT, cwd=os.getcwd())
+    # single-thread obrigatório pro Playwright sync
+    APP.run(host=HOST, port=PORT, threaded=False, use_reloader=False)
