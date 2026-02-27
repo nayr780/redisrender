@@ -1,49 +1,38 @@
-# pw_remote.py  (single-file)
+# main.py — Playwright + Flask (API genérica /do) com DEBUG pesado + auto-install + selftest
 #
-# Playwright + Flask com API "genérica" (máxima flexibilidade) + MUITO debug.
-# ✅ Sem token, sem env obrigatória: rodou, subiu.
-# ✅ Auto-instala o Chromium do Playwright quando precisar.
-# ✅ Um endpoint /do que executa operações flexíveis (1 ou vários steps).
-# ✅ Endpoints de debug: /sysinfo, /browsers, /sessions, /logs
-# ✅ Logs (console, pageerror, requestfailed) por sessão (ring buffer).
-# ✅ Modo cliente embutido pra testar: `python pw_remote.py client`
+# Objetivo:
+# - Máxima flexibilidade: você manda JSON dizendo target/op/args/kwargs e pronto.
+# - Debugabilidade: endpoints de sysinfo/browsers/sessions/logs + traceback detalhado.
+# - Agilidade: auto-instala Chromium se faltar.
 #
-# ⚠️ Importante (sério):
-# - Se você expor isso publicamente sem proteção, você tá basicamente oferecendo um “controle remoto” do navegador.
-# - Eu deixei um "UNSAFE_MODE" (True por padrão) pra você ter controle total.
-#   Se for expor na internet: põe UNSAFE_MODE = False e amplia allowlist só do que você quer.
+# IMPORTANTE (o bug que você pegou):
+# - Playwright SYNC (greenlet) NÃO pode ser usado atravessando threads.
+# - Então este servidor roda SEM threads: threaded=False e use_reloader=False.
+# - Isso resolve o "cannot switch to a different thread".
+#
+# Endpoints:
+#   GET  /              -> 200 (pra healthcheck/probe)
+#   GET  /health
+#   GET  /sysinfo
+#   GET  /browsers
+#   GET  /sessions
+#   GET  /logs?sid=...
+#   POST /install       -> {"browser":"chromium|firefox|webkit"}  (default chromium)
+#   POST /ensure        -> {"browser":"chromium|firefox|webkit", "headless": true/false}
+#   POST /new           -> cria sessão
+#   POST /do            -> executa 1 step ou vários
+#   POST /close         -> {"sid":"..."}
+#   POST /stop
+#   POST /selftest      -> roda um teste completo e retorna resultado (inclusive screenshot b64)
+#
+# Modo cliente local (opcional):
+#   python main.py client http://127.0.0.1:5000
 #
 # Requisitos:
 #   pip install flask playwright
 #
-# Uso:
-#   python pw_remote.py
-#   # server em http://0.0.0.0:5000 (ou PORT se existir)
-#
-# Teste automático (com server já rodando):
-#   python pw_remote.py client
-#
-# Exemplos:
-#   POST /ensure
-#     {"headless": true}
-#
-#   POST /new
-#     {"headless": true, "viewport": {"width": 1280, "height": 720}}
-#
-#   POST /do
-#     {
-#       "sid": "...",
-#       "steps": [
-#         {"t":"page","op":"goto","args":["https://example.com"],"kwargs":{"wait_until":"domcontentloaded"}},
-#         {"t":"page","op":"title"},
-#         {"t":"page","op":"screenshot","kwargs":{"full_page": true}, "return":"b64"}
-#       ]
-#     }
-#
-#   GET /logs?sid=...
-#   GET /sessions
-#   GET /sysinfo
-#   GET /browsers
+# Observação:
+# - Isso é "expostão" de propósito, como você pediu. Se botar público, qualquer um controla um browser seu.
 
 import os
 import sys
@@ -55,7 +44,6 @@ import signal
 import shutil
 import traceback
 import subprocess
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -70,12 +58,10 @@ from playwright.sync_api import (
     Error as PWError,
 )
 
-# ----------------------------
-# Config (sem env obrigatório)
-# ----------------------------
 APP = Flask(__name__)
+
 HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "5000"))  # se a plataforma setar, ele pega. Senão, 5000.
+PORT = int(os.getenv("PORT", "5000"))  # se existir, usa; senão 5000.
 
 BROWSERS_PATH = "/tmp/ms-playwright"
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
@@ -83,12 +69,10 @@ os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
 DEFAULT_TIMEOUT_MS = 30_000
 DEFAULT_HEADLESS = True
 
-# 🔥 Controle total:
-# - True: permite chamar métodos do Playwright sem allowlist (exceto dunder/perigosos óbvios)
-# - False: só allowlist (mais seguro)
+# True = super flexível (chama métodos sem allowlist, bloqueando só dunder e close)
 UNSAFE_MODE = True
 
-# allowlist (usada quando UNSAFE_MODE=False)
+# allowlist (só usada se UNSAFE_MODE=False)
 ALLOWED = {
     "browser": {"new_context", "version"},
     "context": {
@@ -98,8 +82,6 @@ ALLOWED = {
         "storage_state",
         "clear_permissions", "grant_permissions",
         "set_extra_http_headers",
-        "route",  # cuidado: pode exigir callbacks; geralmente não usar por API
-        "unroute",
     },
     "page": {
         "goto", "reload", "go_back", "go_forward",
@@ -112,10 +94,13 @@ ALLOWED = {
         "set_viewport_size",
         "set_extra_http_headers",
         "screenshot",
-        "pdf",  # funciona só em chromium e com certas opções
+        "pdf",
     },
 }
 
+# ⚠️ SEM THREADS aqui. Playwright sync + greenlet precisa disso.
+# Como o Flask dev server vai rodar single-thread, o lock é mais para consistência.
+import threading
 _lock = threading.RLock()
 
 _pw: Optional[Playwright] = None
@@ -207,7 +192,7 @@ def _start_playwright(headless: bool = DEFAULT_HEADLESS, browser: str = "chromiu
                 "python": sys.executable,
                 "executable_path": exe,
             }
-        except PWError as e:
+        except PWError:
             inst = _install(browser=browser)
             try:
                 _browser = _launch()
@@ -265,21 +250,17 @@ def _stop_all_noexcept() -> None:
         _pw = None
 
 
-# ----------------------------
-# Session + logs
-# ----------------------------
 def _new_sid() -> str:
     return base64.urlsafe_b64encode(os.urandom(18)).decode("utf-8").rstrip("=")
 
 
 @dataclass
 class RingLog:
-    limit: int = 300
+    limit: int = 400
     items: List[Dict[str, Any]] = field(default_factory=list)
 
     def add(self, kind: str, data: Dict[str, Any]) -> None:
-        entry = {"ts": _now(), "kind": kind, **data}
-        self.items.append(entry)
+        self.items.append({"ts": _now(), "kind": kind, **data})
         if len(self.items) > self.limit:
             self.items = self.items[-self.limit :]
 
@@ -295,13 +276,10 @@ class Session:
     created_at: float
     headless: bool
     browser_name: str
-    log: RingLog = field(default_factory=lambda: RingLog(limit=400))
+    log: RingLog = field(default_factory=RingLog)
 
     def close(self) -> None:
-        try:
-            self.context.close()
-        finally:
-            pass
+        self.context.close()
 
 
 SESSIONS: Dict[str, Session] = {}
@@ -354,21 +332,14 @@ def _get_target(sid: str, t: str) -> Any:
 
 
 def _is_safe_op(op: str) -> bool:
-    # bloqueia métodos/attrs claramente perigosos/irrelevantes
     if op.startswith("__"):
         return False
     if op in {"close"}:
-        return False  # fecha por endpoint próprio
+        return False
     return True
 
 
 def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any], ret_mode: str) -> Any:
-    """
-    ret_mode:
-      - "json" (default): retorna o valor como estiver (se não serializar, vira string)
-      - "str": força str(result)
-      - "b64": espera bytes e converte base64
-    """
     if not _is_safe_op(op):
         raise ValueError("op_blocked")
 
@@ -391,13 +362,12 @@ def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any],
     if ret_mode == "b64":
         if isinstance(result, (bytes, bytearray)):
             return base64.b64encode(bytes(result)).decode("utf-8")
-        # screenshot/pdf retornam bytes; se não retornar bytes, erro explícito
         raise TypeError("return=b64 requires bytes result")
 
     if ret_mode == "str":
         return str(result)
 
-    # ret_mode json
+    # json
     try:
         json.dumps(result)
         return result
@@ -426,9 +396,6 @@ def _summarize_session(s: Session) -> Dict[str, Any]:
     }
 
 
-# ----------------------------
-# Debug helpers
-# ----------------------------
 def _disk_info(path: str = "/") -> Dict[str, Any]:
     try:
         u = shutil.disk_usage(path)
@@ -447,16 +414,14 @@ def _read_text(p: str, max_bytes: int = 200_000) -> Optional[str]:
 
 
 def _cgroup_hints() -> Dict[str, Any]:
-    # Best-effort: pega umas pistas de quota/limite
-    out = {}
-    # cgroup v2
+    out: Dict[str, Any] = {}
     cpu_max = _read_text("/sys/fs/cgroup/cpu.max")
     mem_max = _read_text("/sys/fs/cgroup/memory.max")
     if cpu_max:
         out["cpu.max"] = cpu_max.strip()
     if mem_max:
         out["memory.max"] = mem_max.strip()
-    # cgroup v1 fallback
+
     cpu_quota = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
     cpu_period = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
     mem_limit = _read_text("/sys/fs/cgroup/memory/memory.limit_in_bytes")
@@ -469,8 +434,8 @@ def _cgroup_hints() -> Dict[str, Any]:
     return out
 
 
-def _list_tree(root: str, max_depth: int = 3, max_items: int = 200) -> List[str]:
-    res = []
+def _list_tree(root: str, max_depth: int = 4, max_items: int = 400) -> List[str]:
+    res: List[str] = []
     root = os.path.abspath(root)
     for base, dirs, files in os.walk(root):
         depth = base[len(root):].count(os.sep)
@@ -478,16 +443,18 @@ def _list_tree(root: str, max_depth: int = 3, max_items: int = 200) -> List[str]
             dirs[:] = []
             continue
         for name in sorted(dirs + files):
-            p = os.path.join(base, name)
-            res.append(p)
+            res.append(os.path.join(base, name))
             if len(res) >= max_items:
                 return res
     return res
 
 
-# ----------------------------
-# Routes
-# ----------------------------
+@APP.get("/")
+def root():
+    # evita 404 no healthcheck/probe da plataforma
+    return jsonify({"ok": True, "hint": "use /health, /new, /do, /selftest"})
+
+
 @APP.get("/health")
 def health():
     return jsonify(
@@ -495,7 +462,6 @@ def health():
             "ok": True,
             "time": _now(),
             "port": PORT,
-            "python": sys.version,
             "python_executable": sys.executable,
             "cwd": os.getcwd(),
             "browsers_path": BROWSERS_PATH,
@@ -508,35 +474,49 @@ def health():
 
 @APP.get("/sysinfo")
 def sysinfo():
-    # super útil pra entender o ambiente (cgroups, disco, etc.)
     return jsonify(
         {
             "ok": True,
             "time": _now(),
             "python_executable": sys.executable,
             "python_version": sys.version,
-            "argv": sys.argv,
             "cwd": os.getcwd(),
             "pid": os.getpid(),
-            "uid": os.getuid() if hasattr(os, "getuid") else None,
-            "gid": os.getgid() if hasattr(os, "getgid") else None,
-            "env_keys_sample": sorted(list(os.environ.keys()))[:60],
             "disk_root": _disk_info("/"),
             "disk_tmp": _disk_info("/tmp"),
             "cgroup": _cgroup_hints(),
             "browsers_path_exists": os.path.exists(BROWSERS_PATH),
-            "browsers_path_list_sample": (os.listdir(BROWSERS_PATH)[:60] if os.path.isdir(BROWSERS_PATH) else []),
+            "browsers_path_list_sample": (os.listdir(BROWSERS_PATH)[:80] if os.path.isdir(BROWSERS_PATH) else []),
+            "env_keys_sample": sorted(list(os.environ.keys()))[:80],
         }
     )
 
 
 @APP.get("/browsers")
 def browsers():
-    # lista a árvore onde o Playwright baixa os browsers
     if not os.path.isdir(BROWSERS_PATH):
         return jsonify({"ok": True, "exists": False, "path": BROWSERS_PATH, "tree": []})
-    tree = _list_tree(BROWSERS_PATH, max_depth=4, max_items=400)
+    tree = _list_tree(BROWSERS_PATH, max_depth=5, max_items=600)
     return jsonify({"ok": True, "exists": True, "path": BROWSERS_PATH, "tree": tree})
+
+
+@APP.get("/sessions")
+def sessions():
+    with _lock:
+        return jsonify({"ok": True, "sessions": [_summarize_session(s) for s in SESSIONS.values()]})
+
+
+@APP.get("/logs")
+def logs():
+    sid = (request.args.get("sid") or "").strip()
+    if not sid:
+        return jsonify({"ok": False, "error": "missing sid query param"}), 400
+    with _lock:
+        try:
+            s = _get_sess(sid)
+        except KeyError:
+            return jsonify({"ok": False, "error": "session_not_found"}), 404
+        return jsonify({"ok": True, "sid": sid, "logs": s.log.dump()})
 
 
 @APP.post("/install")
@@ -574,7 +554,6 @@ def new():
         if isinstance(viewport, dict) and "width" in viewport and "height" in viewport:
             ctx_kwargs["viewport"] = viewport
 
-        # extras úteis
         if isinstance(body.get("user_agent"), str):
             ctx_kwargs["user_agent"] = body["user_agent"]
         if isinstance(body.get("locale"), str):
@@ -598,35 +577,15 @@ def new():
             browser_name=browser,
         )
         _attach_listeners(sess)
-
         SESSIONS[sid] = sess
 
     return jsonify({"ok": True, "sid": sid, "session": _summarize_session(sess), "ensure": res})
 
 
-@APP.get("/sessions")
-def sessions():
-    with _lock:
-        return jsonify({"ok": True, "sessions": [_summarize_session(s) for s in SESSIONS.values()]})
-
-
-@APP.get("/logs")
-def logs():
-    sid = request.args.get("sid", "").strip()
-    if not sid:
-        return jsonify({"ok": False, "error": "missing sid query param"}), 400
-    with _lock:
-        try:
-            s = _get_sess(sid)
-        except KeyError:
-            return jsonify({"ok": False, "error": "session_not_found"}), 404
-        return jsonify({"ok": True, "sid": sid, "logs": s.log.dump()})
-
-
 @APP.post("/close")
 def close():
     body = _json_body()
-    sid = body.get("sid", "")
+    sid = (body.get("sid") or "").strip()
     if not sid:
         return jsonify({"ok": False, "error": "missing sid"}), 400
 
@@ -652,24 +611,29 @@ def stop():
 def do():
     """
     API flexível:
-    - Um step:
-      {"sid":"...","t":"page|context|browser","op":"goto","args":[...],"kwargs":{...},"return":"json|str|b64"}
-    - Vários:
-      {"sid":"...","steps":[{...},{...}]}
-    Retorna:
-      - results com timing e erro detalhado (traceback)
+      - single:
+        {"sid":"...","t":"page|context|browser","op":"goto","args":[...],"kwargs":{...},"return":"json|str|b64"}
+      - multi:
+        {"sid":"...","steps":[{...},{...}]}
+
+    Regras:
+      - "sid" pode ficar no topo e também dentro de step. Se step não tiver sid, usa o sid do topo.
+      - Retorna traceback curto no erro.
     """
     body = _json_body()
-    sid = str(body.get("sid", "")).strip()
+    top_sid = (body.get("sid") or "").strip()
 
     def exec_step(step: Dict[str, Any]) -> Dict[str, Any]:
         t0 = _now()
+        sid = (step.get("sid") or top_sid or "").strip()
         t = str(step.get("t", step.get("target", "page"))).strip()
         op = str(step.get("op", "")).strip()
         args = step.get("args", [])
         kwargs = step.get("kwargs", {})
         ret_mode = str(step.get("return", "json")).strip().lower()
 
+        if not sid and t != "browser":
+            raise ValueError("missing sid")
         if not op:
             raise ValueError("missing op")
         if not isinstance(args, list):
@@ -682,6 +646,7 @@ def do():
         result = _call_op(sid, t, op, args, kwargs, ret_mode)
         return {
             "ok": True,
+            "sid": sid,
             "t": t,
             "op": op,
             "dt_ms": round((_now() - t0) * 1000, 3),
@@ -694,35 +659,102 @@ def do():
     if not isinstance(steps, list) or not steps:
         return jsonify({"ok": False, "error": "steps must be a non-empty list"}), 400
 
-    out = []
+    out: List[Dict[str, Any]] = []
     with _lock:
         for i, step in enumerate(steps):
             if not isinstance(step, dict):
                 return jsonify({"ok": False, "error": f"step {i} must be object"}), 400
             try:
-                r = exec_step(step)
-                out.append(r)
+                out.append(exec_step(step))
             except Exception as e:
-                tb = traceback.format_exc(limit=8)
                 out.append(
                     {
                         "ok": False,
                         "step_index": i,
                         "error": str(e),
-                        "traceback": tb,
+                        "traceback": traceback.format_exc(limit=10),
                         "step": step,
                     }
                 )
-                # para no primeiro erro (pra debug rápido). Se quiser continuar, comenta o break.
                 break
 
-        ok = all(x.get("ok") for x in out)
-        return jsonify({"ok": ok, "results": out}), (200 if ok else 500)
+    ok = all(x.get("ok") for x in out)
+    return jsonify({"ok": ok, "results": out}), (200 if ok else 500)
 
 
-# ----------------------------
-# Shutdown hooks
-# ----------------------------
+@APP.post("/selftest")
+def selftest():
+    """
+    Roda um teste completo no próprio runtime:
+      - ensure chromium
+      - new session
+      - goto example.com
+      - title
+      - screenshot b64
+      - close session
+    """
+    body = _json_body()
+    browser = body.get("browser", "chromium")
+    headless = bool(body.get("headless", True))
+    url = body.get("url", "https://example.com")
+
+    ensure_res = _start_playwright(headless=headless, browser=browser)
+    if not ensure_res.get("ok"):
+        return jsonify({"ok": False, "stage": "ensure", "ensure": ensure_res}), 500
+
+    sid = None
+    try:
+        with _lock:
+            sid = _new_sid()
+            context = _browser.new_context()  # type: ignore
+            context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+            context.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
+            page = context.new_page()
+
+            sess = Session(
+                sid=sid,
+                context=context,
+                page=page,
+                created_at=_now(),
+                headless=headless,
+                browser_name=browser,
+            )
+            _attach_listeners(sess)
+            SESSIONS[sid] = sess
+
+            page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+            title = page.title()
+            shot = page.screenshot(full_page=True)
+            shot_b64 = base64.b64encode(shot).decode("utf-8")
+
+            logs_dump = sess.log.dump()[-50:]
+
+            sess.close()
+            SESSIONS.pop(sid, None)
+
+        return jsonify(
+            {
+                "ok": True,
+                "ensure": ensure_res,
+                "url": url,
+                "title": title,
+                "screenshot_b64": shot_b64,
+                "logs_tail": logs_dump,
+            }
+        )
+    except Exception as e:
+        tb = traceback.format_exc(limit=12)
+        # cleanup best-effort
+        with _lock:
+            if sid and sid in SESSIONS:
+                try:
+                    SESSIONS[sid].close()
+                except Exception:
+                    pass
+                SESSIONS.pop(sid, None)
+        return jsonify({"ok": False, "stage": "run", "error": str(e), "traceback": tb}), 500
+
+
 def _on_exit(*_args):
     _stop_all_noexcept()
 
@@ -733,10 +765,9 @@ signal.signal(signal.SIGINT, _on_exit)
 
 
 # ----------------------------
-# Client mode (test rápido)
+# Client mode (pra testar do seu PC)
 # ----------------------------
 def _http_json(url: str, payload: Optional[Dict[str, Any]] = None, method: str = "POST") -> Tuple[int, Dict[str, Any]]:
-    # stdlib only (sem requests)
     import urllib.request
 
     data = None
@@ -745,7 +776,7 @@ def _http_json(url: str, payload: Optional[Dict[str, Any]] = None, method: str =
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=90) as resp:
             code = resp.getcode()
             body = resp.read().decode("utf-8", errors="ignore")
             try:
@@ -756,50 +787,29 @@ def _http_json(url: str, payload: Optional[Dict[str, Any]] = None, method: str =
         return 0, {"ok": False, "error": str(e)}
 
 
-def client_demo(base: str = "http://127.0.0.1:5000"):
+def client_demo(base: str):
     print("== client demo ==")
-    code, h = _http_json(base + "/health", None, method="GET")
-    print("health:", code, h)
+    c, h = _http_json(base + "/health", None, method="GET")
+    print("health:", c, h)
 
-    code, ens = _http_json(base + "/ensure", {"headless": True, "browser": "chromium"})
-    print("ensure:", code, ens)
+    c, st = _http_json(base + "/selftest", {"browser": "chromium", "headless": True, "url": "https://example.com"})
+    print("selftest:", c, {"ok": st.get("ok"), "title": st.get("title")})
 
-    code, nw = _http_json(base + "/new", {"headless": True, "viewport": {"width": 1280, "height": 720}})
-    print("new:", code, {"ok": nw.get("ok"), "sid": nw.get("sid")})
-    sid = nw.get("sid")
-    if not sid:
-        print("no sid; abort")
-        return
-
-    steps = [
-        {"sid": sid, "t": "page", "op": "goto", "args": ["https://example.com"], "kwargs": {"wait_until": "domcontentloaded"}},
-        {"sid": sid, "t": "page", "op": "title"},
-        {"sid": sid, "t": "page", "op": "screenshot", "kwargs": {"full_page": True}, "return": "b64"},
-    ]
-    code, res = _http_json(base + "/do", {"sid": sid, "steps": steps})
-    print("do:", code, {"ok": res.get("ok"), "steps": len(res.get("results", []))})
-
-    # salva screenshot local
-    try:
-        b64 = res["results"][2]["result"]
-        img = base64.b64decode(b64.encode("utf-8"))
-        with open("demo.png", "wb") as f:
-            f.write(img)
-        print("saved demo.png")
-    except Exception as e:
-        print("could not save screenshot:", e)
-
-    code, lg = _http_json(base + f"/logs?sid={sid}", None, method="GET")
-    print("logs:", code, f"{len(lg.get('logs', []))} items")
-
-    code, cl = _http_json(base + "/close", {"sid": sid})
-    print("close:", code, cl)
+    # salva screenshot local (se vier)
+    if st.get("ok") and st.get("screenshot_b64"):
+        try:
+            img = base64.b64decode(st["screenshot_b64"])
+            with open("selftest.png", "wb") as f:
+                f.write(img)
+            print("saved selftest.png")
+        except Exception as e:
+            print("failed saving image:", e)
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1].lower() == "client":
-        # se você rodar em outra porta, passe: python pw_remote.py client http://127.0.0.1:XXXX
         base = sys.argv[2] if len(sys.argv) >= 3 else f"http://127.0.0.1:{PORT}"
-        client_demo(base=base)
+        client_demo(base)
     else:
-        APP.run(host=HOST, port=PORT, threaded=True)
+        # ✅ CRÍTICO: SEM threads e SEM reloader (senão dá greenlet/thread crash)
+        APP.run(host=HOST, port=PORT, threaded=False, use_reloader=False)
