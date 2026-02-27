@@ -1,734 +1,805 @@
+# pw_remote.py  (single-file)
+#
+# Playwright + Flask com API "genérica" (máxima flexibilidade) + MUITO debug.
+# ✅ Sem token, sem env obrigatória: rodou, subiu.
+# ✅ Auto-instala o Chromium do Playwright quando precisar.
+# ✅ Um endpoint /do que executa operações flexíveis (1 ou vários steps).
+# ✅ Endpoints de debug: /sysinfo, /browsers, /sessions, /logs
+# ✅ Logs (console, pageerror, requestfailed) por sessão (ring buffer).
+# ✅ Modo cliente embutido pra testar: `python pw_remote.py client`
+#
+# ⚠️ Importante (sério):
+# - Se você expor isso publicamente sem proteção, você tá basicamente oferecendo um “controle remoto” do navegador.
+# - Eu deixei um "UNSAFE_MODE" (True por padrão) pra você ter controle total.
+#   Se for expor na internet: põe UNSAFE_MODE = False e amplia allowlist só do que você quer.
+#
+# Requisitos:
+#   pip install flask playwright
+#
+# Uso:
+#   python pw_remote.py
+#   # server em http://0.0.0.0:5000 (ou PORT se existir)
+#
+# Teste automático (com server já rodando):
+#   python pw_remote.py client
+#
+# Exemplos:
+#   POST /ensure
+#     {"headless": true}
+#
+#   POST /new
+#     {"headless": true, "viewport": {"width": 1280, "height": 720}}
+#
+#   POST /do
+#     {
+#       "sid": "...",
+#       "steps": [
+#         {"t":"page","op":"goto","args":["https://example.com"],"kwargs":{"wait_until":"domcontentloaded"}},
+#         {"t":"page","op":"title"},
+#         {"t":"page","op":"screenshot","kwargs":{"full_page": true}, "return":"b64"}
+#       ]
+#     }
+#
+#   GET /logs?sid=...
+#   GET /sessions
+#   GET /sysinfo
+#   GET /browsers
+
 import os
-import pwd
+import sys
+import json
 import time
-import socket
-import platform
-import datetime
-from pathlib import Path
+import base64
+import atexit
+import signal
+import shutil
+import traceback
+import subprocess
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, List, Tuple
 
-import psutil
-from flask import Flask, render_template_string, request
+from flask import Flask, request, jsonify
 
-app = Flask(__name__)
+from playwright.sync_api import (
+    sync_playwright,
+    Playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    Error as PWError,
+)
 
-# =========================
-# CONFIG
-# =========================
-SCAN_ROOT = os.getenv("MONITOR_SCAN_ROOT", ".")
-MAX_TREE_DEPTH = int(os.getenv("MONITOR_MAX_TREE_DEPTH", "2"))
-MAX_ITEMS_PER_DIR = int(os.getenv("MONITOR_MAX_ITEMS_PER_DIR", "50"))
-SHOW_HIDDEN = os.getenv("MONITOR_SHOW_HIDDEN", "0") == "1"
-SHOW_FULL_ENV = os.getenv("MONITOR_SHOW_FULL_ENV", "0") == "1"
-PORT = int(os.getenv("PORT", "5000"))
+# ----------------------------
+# Config (sem env obrigatório)
+# ----------------------------
+APP = Flask(__name__)
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", "5000"))  # se a plataforma setar, ele pega. Senão, 5000.
 
-SENSITIVE_ENV_KEYS = [
-    "KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "PWD",
-    "DATABASE_URL", "DB_URL", "API_KEY", "ACCESS_KEY",
-    "PRIVATE", "JWT", "AUTH", "SESSION", "COOKIE"
-]
+BROWSERS_PATH = "/tmp/ms-playwright"
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
 
-# =========================
-# HELPERS
-# =========================
-def format_bytes(num):
-    """Converte bytes para formato legível."""
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-        if num < 1024:
-            return f"{num:.2f} {unit}"
-        num /= 1024
-    return f"{num:.2f} EB"
+DEFAULT_TIMEOUT_MS = 30_000
+DEFAULT_HEADLESS = True
 
+# 🔥 Controle total:
+# - True: permite chamar métodos do Playwright sem allowlist (exceto dunder/perigosos óbvios)
+# - False: só allowlist (mais seguro)
+UNSAFE_MODE = True
 
-def format_seconds(seconds):
-    seconds = int(seconds)
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes, seconds = divmod(seconds, 60)
+# allowlist (usada quando UNSAFE_MODE=False)
+ALLOWED = {
+    "browser": {"new_context", "version"},
+    "context": {
+        "new_page",
+        "add_cookies", "clear_cookies", "cookies",
+        "set_default_timeout", "set_default_navigation_timeout",
+        "storage_state",
+        "clear_permissions", "grant_permissions",
+        "set_extra_http_headers",
+        "route",  # cuidado: pode exigir callbacks; geralmente não usar por API
+        "unroute",
+    },
+    "page": {
+        "goto", "reload", "go_back", "go_forward",
+        "title", "content",
+        "click", "dblclick", "fill", "type", "press",
+        "check", "uncheck", "select_option",
+        "hover", "focus",
+        "wait_for_timeout", "wait_for_selector", "wait_for_load_state",
+        "evaluate", "eval_on_selector",
+        "set_viewport_size",
+        "set_extra_http_headers",
+        "screenshot",
+        "pdf",  # funciona só em chromium e com certas opções
+    },
+}
 
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes:
-        parts.append(f"{minutes}m")
-    parts.append(f"{seconds}s")
-    return " ".join(parts)
+_lock = threading.RLock()
 
-
-def safe_env_value(key, value):
-    """Mascara variáveis sensíveis, a menos que SHOW_FULL_ENV esteja habilitado."""
-    if SHOW_FULL_ENV:
-        return value
-
-    key_upper = key.upper()
-    if any(word in key_upper for word in SENSITIVE_ENV_KEYS):
-        if not value:
-            return "[MASKED]"
-        if len(value) <= 6:
-            return "[MASKED]"
-        return value[:3] + "*" * (len(value) - 6) + value[-3:]
-    return value
+_pw: Optional[Playwright] = None
+_browser: Optional[Browser] = None
 
 
-def get_system_info():
-    boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
-    now = datetime.datetime.now()
+def _now() -> float:
+    return time.time()
 
+
+def _json_body() -> Dict[str, Any]:
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    raw = (request.data or b"").decode("utf-8", errors="ignore").strip()
+    if not raw:
+        return {}
     try:
-        current_user = pwd.getpwuid(os.getuid()).pw_name
+        return json.loads(raw)
     except Exception:
-        current_user = os.getenv("USER", "unknown")
-
-    return {
-        "os": platform.system(),
-        "os_release": platform.release(),
-        "os_version": platform.version(),
-        "hostname": socket.gethostname(),
-        "fqdn": socket.getfqdn(),
-        "processor": platform.processor() or "N/A",
-        "machine": platform.machine(),
-        "architecture": " / ".join(platform.architecture()),
-        "python_version": platform.python_version(),
-        "current_user": current_user,
-        "cwd": os.getcwd(),
-        "executable": os.path.abspath(__file__),
-        "boot_time": boot_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "uptime": format_seconds(time.time() - psutil.boot_time()),
-        "server_time": now.strftime("%Y-%m-%d %H:%M:%S"),
-    }
+        return {"_raw": raw}
 
 
-def get_cpu_info():
-    try:
-        load_avg = os.getloadavg()
-        load_avg = f"{load_avg[0]:.2f}, {load_avg[1]:.2f}, {load_avg[2]:.2f}"
-    except Exception:
-        load_avg = "N/A"
-
-    return {
-        "cpu_percent": psutil.cpu_percent(interval=1),
-        "cpu_count_logical": psutil.cpu_count(logical=True),
-        "cpu_count_physical": psutil.cpu_count(logical=False),
-        "cpu_freq": psutil.cpu_freq().current if psutil.cpu_freq() else None,
-        "load_avg": load_avg,
-        "per_cpu": psutil.cpu_percent(interval=0.2, percpu=True),
-    }
-
-
-def get_memory_info():
-    ram = psutil.virtual_memory()
-    swap = psutil.swap_memory()
-    return {
-        "ram_total": format_bytes(ram.total),
-        "ram_used": format_bytes(ram.used),
-        "ram_available": format_bytes(ram.available),
-        "ram_percent": ram.percent,
-        "swap_total": format_bytes(swap.total),
-        "swap_used": format_bytes(swap.used),
-        "swap_percent": swap.percent,
-    }
-
-
-def get_disk_info():
-    disks = []
-
-    try:
-        partitions = psutil.disk_partitions(all=False)
-    except Exception:
-        partitions = []
-
-    for part in partitions:
-        try:
-            usage = psutil.disk_usage(part.mountpoint)
-            disks.append({
-                "device": part.device,
-                "mountpoint": part.mountpoint,
-                "fstype": part.fstype,
-                "total": format_bytes(usage.total),
-                "used": format_bytes(usage.used),
-                "free": format_bytes(usage.free),
-                "percent": usage.percent,
-            })
-        except PermissionError:
-            disks.append({
-                "device": part.device,
-                "mountpoint": part.mountpoint,
-                "fstype": part.fstype,
-                "total": "Permission denied",
-                "used": "-",
-                "free": "-",
-                "percent": "-",
-            })
-        except Exception as e:
-            disks.append({
-                "device": part.device,
-                "mountpoint": part.mountpoint,
-                "fstype": part.fstype,
-                "total": f"Error: {e}",
-                "used": "-",
-                "free": "-",
-                "percent": "-",
-            })
-
-    return disks
-
-
-def get_network_info():
-    interfaces = []
-    addrs = psutil.net_if_addrs()
-    stats = psutil.net_if_stats()
-
-    for iface, iface_addrs in addrs.items():
-        iface_data = {
-            "name": iface,
-            "is_up": stats.get(iface).isup if iface in stats else False,
-            "speed": stats.get(iface).speed if iface in stats else None,
-            "mtu": stats.get(iface).mtu if iface in stats else None,
-            "addresses": [],
-        }
-
-        for addr in iface_addrs:
-            family = str(addr.family)
-            if "AF_INET" in family:
-                fam = "IPv4"
-            elif "AF_INET6" in family:
-                fam = "IPv6"
-            elif "AF_PACKET" in family or "AF_LINK" in family:
-                fam = "MAC"
-            else:
-                fam = family
-
-            iface_data["addresses"].append({
-                "family": fam,
-                "address": addr.address,
-                "netmask": addr.netmask,
-                "broadcast": addr.broadcast,
-            })
-
-        interfaces.append(iface_data)
-
-    io = psutil.net_io_counters()
-    return {
-        "interfaces": interfaces,
-        "io": {
-            "bytes_sent": format_bytes(io.bytes_sent),
-            "bytes_recv": format_bytes(io.bytes_recv),
-            "packets_sent": io.packets_sent,
-            "packets_recv": io.packets_recv,
-        }
-    }
-
-
-def get_listening_ports():
-    ports = []
-    try:
-        connections = psutil.net_connections(kind="inet")
-    except Exception as e:
-        return [{"error": str(e)}]
-
-    for conn in connections:
-        if conn.status == psutil.CONN_LISTEN:
-            pid = conn.pid
-            process_name = "N/A"
-            try:
-                if pid:
-                    process_name = psutil.Process(pid).name()
-            except Exception:
-                pass
-
-            local_ip = conn.laddr.ip if conn.laddr else "-"
-            local_port = conn.laddr.port if conn.laddr else "-"
-
-            ports.append({
-                "ip": local_ip,
-                "port": local_port,
-                "pid": pid,
-                "process": process_name,
-                "family": str(conn.family),
-                "type": str(conn.type),
-            })
-
-    ports.sort(key=lambda x: (str(x.get("ip")), int(x.get("port", 0)) if str(x.get("port")).isdigit() else 0))
-    return ports
-
-
-def build_tree(path_str, depth=0, max_depth=2):
-    """Monta uma árvore simples de arquivos/pastas."""
-    result = []
-
-    try:
-        path = Path(path_str)
-        if not path.exists():
-            return [f"[NOT FOUND] {path_str}"]
-
-        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-        count = 0
-
-        for entry in entries:
-            if not SHOW_HIDDEN and entry.name.startswith("."):
-                continue
-
-            prefix = "    " * depth
-            if entry.is_dir():
-                result.append(f"{prefix}📁 {entry.name}/")
-                if depth < max_depth:
-                    result.extend(build_tree(entry, depth + 1, max_depth))
-            else:
-                try:
-                    size = entry.stat().st_size
-                    result.append(f"{prefix}📄 {entry.name} ({format_bytes(size)})")
-                except Exception:
-                    result.append(f"{prefix}📄 {entry.name}")
-
-            count += 1
-            if count >= MAX_ITEMS_PER_DIR:
-                result.append(f"{prefix}... limite de {MAX_ITEMS_PER_DIR} itens atingido")
-                break
-
-    except PermissionError:
-        result.append(f"{'    '*depth}[PERMISSION DENIED] {path_str}")
-    except Exception as e:
-        result.append(f"{'    '*depth}[ERROR] {path_str}: {e}")
-
-    return result
-
-
-def get_environment_variables():
-    envs = []
-    for key in sorted(os.environ.keys(), key=lambda x: x.lower()):
-        value = os.environ.get(key, "")
-        envs.append({
-            "key": key,
-            "value": safe_env_value(key, value)
-        })
-    return envs
-
-
-def get_top_processes(limit=15):
-    procs = []
-    for proc in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_percent"]):
-        try:
-            info = proc.info
-            procs.append({
-                "pid": info["pid"],
-                "name": info["name"] or "N/A",
-                "username": info["username"] or "N/A",
-                "cpu_percent": info["cpu_percent"] or 0.0,
-                "memory_percent": round(info["memory_percent"] or 0.0, 2),
-            })
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-    procs.sort(key=lambda x: (x["cpu_percent"], x["memory_percent"]), reverse=True)
-    return procs[:limit]
-
-
-# =========================
-# TEMPLATE
-# =========================
-TEMPLATE = """
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <title>System Monitor Completo</title>
-    <meta http-equiv="refresh" content="8">
-    <style>
-        * { box-sizing: border-box; }
-        body {
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background: #0f1115;
-            color: #e8e8e8;
-        }
-        header {
-            background: #151922;
-            padding: 20px;
-            border-bottom: 1px solid #2b3240;
-            position: sticky;
-            top: 0;
-            z-index: 10;
-        }
-        header h1 {
-            margin: 0;
-            color: #55e6c1;
-            font-size: 28px;
-        }
-        header p {
-            margin: 6px 0 0;
-            color: #aab3c5;
-        }
-        .container {
-            padding: 20px;
-            max-width: 1600px;
-            margin: 0 auto;
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
-            gap: 18px;
-        }
-        .box {
-            background: #171b24;
-            border: 1px solid #2a3140;
-            border-radius: 12px;
-            padding: 16px;
-            box-shadow: 0 4px 18px rgba(0,0,0,0.25);
-        }
-        .box h2 {
-            margin-top: 0;
-            color: #7ee7ff;
-            border-bottom: 1px solid #2a3140;
-            padding-bottom: 10px;
-        }
-        .kv {
-            display: grid;
-            grid-template-columns: 180px 1fr;
-            gap: 8px 10px;
-            font-size: 14px;
-        }
-        .kv div:nth-child(odd) {
-            color: #9eb0c7;
-            font-weight: bold;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-        }
-        th, td {
-            padding: 8px;
-            text-align: left;
-            border-bottom: 1px solid #2a3140;
-            vertical-align: top;
-        }
-        th {
-            color: #9fe6ff;
-            background: #1c2230;
-            position: sticky;
-            top: 0;
-        }
-        .mono {
-            font-family: Consolas, Monaco, monospace;
-            font-size: 12px;
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-        .scroll {
-            max-height: 360px;
-            overflow: auto;
-            border: 1px solid #263041;
-            border-radius: 8px;
-            padding: 10px;
-            background: #10151e;
-        }
-        .tag {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 999px;
-            background: #233044;
-            color: #d2ebff;
-            font-size: 12px;
-            margin-right: 6px;
-            margin-bottom: 6px;
-        }
-        .ok { color: #6bf28c; }
-        .warn { color: #ffd166; }
-        .bad { color: #ff6b6b; }
-        a {
-            color: #7ee7ff;
-            text-decoration: none;
-        }
-        .footer-note {
-            margin-top: 20px;
-            color: #93a0b5;
-            font-size: 12px;
-        }
-    </style>
-</head>
-<body>
-<header>
-    <h1>Flask System Monitor Completo</h1>
-    <p>Atualização automática a cada 8 segundos</p>
-</header>
-
-<div class="container">
-    <div class="grid">
-
-        <div class="box">
-            <h2>Resumo do Sistema</h2>
-            <div class="kv">
-                <div>OS</div><div>{{ system.os }} {{ system.os_release }}</div>
-                <div>Versão</div><div>{{ system.os_version }}</div>
-                <div>Hostname</div><div>{{ system.hostname }}</div>
-                <div>FQDN</div><div>{{ system.fqdn }}</div>
-                <div>Processor</div><div>{{ system.processor }}</div>
-                <div>Machine</div><div>{{ system.machine }}</div>
-                <div>Arquitetura</div><div>{{ system.architecture }}</div>
-                <div>Python</div><div>{{ system.python_version }}</div>
-                <div>Usuário</div><div>{{ system.current_user }}</div>
-                <div>Diretório atual</div><div class="mono">{{ system.cwd }}</div>
-                <div>Arquivo atual</div><div class="mono">{{ system.executable }}</div>
-                <div>Boot time</div><div>{{ system.boot_time }}</div>
-                <div>Uptime</div><div>{{ system.uptime }}</div>
-                <div>Hora do servidor</div><div>{{ system.server_time }}</div>
-            </div>
-        </div>
-
-        <div class="box">
-            <h2>CPU</h2>
-            <div class="kv">
-                <div>Uso total</div>
-                <div class="{% if cpu.cpu_percent >= 85 %}bad{% elif cpu.cpu_percent >= 60 %}warn{% else %}ok{% endif %}">
-                    {{ cpu.cpu_percent }}%
-                </div>
-
-                <div>CPUs lógicas</div><div>{{ cpu.cpu_count_logical }}</div>
-                <div>CPUs físicas</div><div>{{ cpu.cpu_count_physical }}</div>
-                <div>Frequência</div><div>{{ "%.2f MHz"|format(cpu.cpu_freq) if cpu.cpu_freq else "N/A" }}</div>
-                <div>Load average</div><div>{{ cpu.load_avg }}</div>
-            </div>
-
-            <h3>Uso por núcleo</h3>
-            <div>
-                {% for item in cpu.per_cpu %}
-                    <span class="tag">CPU {{ loop.index0 }}: {{ item }}%</span>
-                {% endfor %}
-            </div>
-        </div>
-
-        <div class="box">
-            <h2>Memória</h2>
-            <div class="kv">
-                <div>RAM total</div><div>{{ memory.ram_total }}</div>
-                <div>RAM usada</div>
-                <div class="{% if memory.ram_percent >= 85 %}bad{% elif memory.ram_percent >= 60 %}warn{% else %}ok{% endif %}">
-                    {{ memory.ram_used }} ({{ memory.ram_percent }}%)
-                </div>
-                <div>RAM disponível</div><div>{{ memory.ram_available }}</div>
-                <div>Swap total</div><div>{{ memory.swap_total }}</div>
-                <div>Swap usada</div><div>{{ memory.swap_used }} ({{ memory.swap_percent }}%)</div>
-            </div>
-        </div>
-
-        <div class="box">
-            <h2>Rede</h2>
-            <div class="kv">
-                <div>Bytes enviados</div><div>{{ network.io.bytes_sent }}</div>
-                <div>Bytes recebidos</div><div>{{ network.io.bytes_recv }}</div>
-                <div>Pacotes enviados</div><div>{{ network.io.packets_sent }}</div>
-                <div>Pacotes recebidos</div><div>{{ network.io.packets_recv }}</div>
-            </div>
-
-            <h3>Interfaces</h3>
-            <div class="scroll">
-                {% for iface in network.interfaces %}
-                    <div style="margin-bottom:14px;">
-                        <b>{{ iface.name }}</b>
-                        -
-                        {% if iface.is_up %}
-                            <span class="ok">UP</span>
-                        {% else %}
-                            <span class="bad">DOWN</span>
-                        {% endif %}
-                        | speed: {{ iface.speed if iface.speed is not none else "N/A" }} Mbps
-                        | mtu: {{ iface.mtu if iface.mtu is not none else "N/A" }}
-
-                        <div class="mono" style="margin-top:6px;">
-{% for addr in iface.addresses %}
-[{{ addr.family }}] {{ addr.address }} | netmask={{ addr.netmask }} | broadcast={{ addr.broadcast }}
-{% endfor %}
-                        </div>
-                    </div>
-                {% endfor %}
-            </div>
-        </div>
-
-        <div class="box">
-            <h2>Portas Abertas (LISTEN)</h2>
-            <div class="scroll">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>IP</th>
-                            <th>Porta</th>
-                            <th>PID</th>
-                            <th>Processo</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% if open_ports and open_ports[0].get("error") %}
-                            <tr>
-                                <td colspan="4" class="bad">{{ open_ports[0]["error"] }}</td>
-                            </tr>
-                        {% else %}
-                            {% for p in open_ports %}
-                                <tr>
-                                    <td>{{ p.ip }}</td>
-                                    <td>{{ p.port }}</td>
-                                    <td>{{ p.pid }}</td>
-                                    <td>{{ p.process }}</td>
-                                </tr>
-                            {% endfor %}
-                            {% if not open_ports %}
-                                <tr><td colspan="4">Nenhuma porta em LISTEN encontrada.</td></tr>
-                            {% endif %}
-                        {% endif %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <div class="box">
-            <h2>Discos / Partições</h2>
-            <div class="scroll">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Device</th>
-                            <th>Mount</th>
-                            <th>FS</th>
-                            <th>Total</th>
-                            <th>Usado</th>
-                            <th>Livre</th>
-                            <th>%</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for d in disks %}
-                            <tr>
-                                <td>{{ d.device }}</td>
-                                <td>{{ d.mountpoint }}</td>
-                                <td>{{ d.fstype }}</td>
-                                <td>{{ d.total }}</td>
-                                <td>{{ d.used }}</td>
-                                <td>{{ d.free }}</td>
-                                <td class="{% if d.percent != '-' and d.percent >= 90 %}bad{% elif d.percent != '-' and d.percent >= 75 %}warn{% else %}ok{% endif %}">
-                                    {{ d.percent }}
-                                </td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <div class="box">
-            <h2>Arquivos e Pastas</h2>
-            <p><b>Raiz analisada:</b> <span class="mono">{{ scan_root }}</span></p>
-            <p><b>Profundidade:</b> {{ max_tree_depth }} | <b>Itens por pasta:</b> {{ max_items_per_dir }}</p>
-            <div class="scroll mono">{% for line in file_tree %}{{ line }}
-{% endfor %}</div>
-        </div>
-
-        <div class="box">
-            <h2>Variáveis de Ambiente</h2>
-            <p>
-                {% if show_full_env %}
-                    <span class="warn">Modo completo ativado: valores sem máscara.</span>
-                {% else %}
-                    <span class="ok">Valores sensíveis mascarados.</span>
-                {% endif %}
-            </p>
-            <div class="scroll">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Chave</th>
-                            <th>Valor</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for env in env_vars %}
-                            <tr>
-                                <td>{{ env.key }}</td>
-                                <td class="mono">{{ env.value }}</td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <div class="box">
-            <h2>Top Processos</h2>
-            <div class="scroll">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>PID</th>
-                            <th>Nome</th>
-                            <th>Usuário</th>
-                            <th>CPU %</th>
-                            <th>Mem %</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for p in processes %}
-                            <tr>
-                                <td>{{ p.pid }}</td>
-                                <td>{{ p.name }}</td>
-                                <td>{{ p.username }}</td>
-                                <td>{{ p.cpu_percent }}</td>
-                                <td>{{ p.memory_percent }}</td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-    </div>
-
-    <div class="footer-note">
-        Dica: use as variáveis MONITOR_SCAN_ROOT, MONITOR_MAX_TREE_DEPTH, MONITOR_MAX_ITEMS_PER_DIR,
-        MONITOR_SHOW_HIDDEN e MONITOR_SHOW_FULL_ENV para controlar a visualização.
-    </div>
-</div>
-</body>
-</html>
-"""
-
-
-# =========================
-# ROUTE
-# =========================
-@app.route("/")
-def home():
-    system = get_system_info()
-    cpu = get_cpu_info()
-    memory = get_memory_info()
-    disks = get_disk_info()
-    network = get_network_info()
-    open_ports = get_listening_ports()
-    file_tree = build_tree(SCAN_ROOT, depth=0, max_depth=MAX_TREE_DEPTH)
-    env_vars = get_environment_variables()
-    processes = get_top_processes(limit=15)
-
-    return render_template_string(
-        TEMPLATE,
-        system=system,
-        cpu=cpu,
-        memory=memory,
-        disks=disks,
-        network=network,
-        open_ports=open_ports,
-        file_tree=file_tree,
-        env_vars=env_vars,
-        processes=processes,
-        scan_root=os.path.abspath(SCAN_ROOT),
-        max_tree_depth=MAX_TREE_DEPTH,
-        max_items_per_dir=MAX_ITEMS_PER_DIR,
-        show_full_env=SHOW_FULL_ENV,
-        request_ip=request.remote_addr,
+def _run(cmd: List[str], env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env or os.environ.copy(),
     )
 
 
+def _ensure_dirs() -> None:
+    os.makedirs(BROWSERS_PATH, exist_ok=True)
+
+
+def _install(browser: str = "chromium") -> Dict[str, Any]:
+    _ensure_dirs()
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
+    cmd = [sys.executable, "-m", "playwright", "install", browser]
+    proc = _run(cmd, env=env)
+    return {
+        "ok": proc.returncode == 0,
+        "cmd": " ".join(cmd),
+        "returncode": proc.returncode,
+        "stdout_tail": proc.stdout[-4000:],
+        "stderr_tail": proc.stderr[-4000:],
+        "browsers_path": BROWSERS_PATH,
+        "python": sys.executable,
+    }
+
+
+def _start_playwright(headless: bool = DEFAULT_HEADLESS, browser: str = "chromium") -> Dict[str, Any]:
+    """Sobe Playwright + Browser; se faltar executável, instala e tenta de novo."""
+    global _pw, _browser
+    with _lock:
+        if _pw and _browser:
+            return {"ok": True, "status": "already_running", "browser": browser}
+
+        _ensure_dirs()
+        _pw = sync_playwright().start()
+
+        def _launch() -> Browser:
+            if browser == "chromium":
+                return _pw.chromium.launch(
+                    headless=headless,
+                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                )
+            if browser == "firefox":
+                return _pw.firefox.launch(headless=headless)
+            if browser == "webkit":
+                return _pw.webkit.launch(headless=headless)
+            raise ValueError("browser must be chromium|firefox|webkit")
+
+        try:
+            _browser = _launch()
+            exe = None
+            try:
+                exe = getattr(getattr(_pw, browser), "executable_path", None)
+            except Exception:
+                exe = None
+            return {
+                "ok": True,
+                "status": "started",
+                "headless": headless,
+                "browser": browser,
+                "browsers_path": BROWSERS_PATH,
+                "python": sys.executable,
+                "executable_path": exe,
+            }
+        except PWError as e:
+            inst = _install(browser=browser)
+            try:
+                _browser = _launch()
+                exe = None
+                try:
+                    exe = getattr(getattr(_pw, browser), "executable_path", None)
+                except Exception:
+                    exe = None
+                return {
+                    "ok": True,
+                    "status": "started_after_install",
+                    "headless": headless,
+                    "browser": browser,
+                    "install": inst,
+                    "browsers_path": BROWSERS_PATH,
+                    "python": sys.executable,
+                    "executable_path": exe,
+                }
+            except PWError as e2:
+                _stop_all_noexcept()
+                return {
+                    "ok": False,
+                    "status": "failed_to_start",
+                    "browser": browser,
+                    "error": str(e2),
+                    "install": inst,
+                }
+
+
+def _stop_all_noexcept() -> None:
+    global _pw, _browser, SESSIONS
+    with _lock:
+        try:
+            for sid in list(SESSIONS.keys()):
+                try:
+                    SESSIONS[sid].close()
+                except Exception:
+                    pass
+                SESSIONS.pop(sid, None)
+        except Exception:
+            pass
+
+        try:
+            if _browser:
+                _browser.close()
+        except Exception:
+            pass
+        _browser = None
+
+        try:
+            if _pw:
+                _pw.stop()
+        except Exception:
+            pass
+        _pw = None
+
+
+# ----------------------------
+# Session + logs
+# ----------------------------
+def _new_sid() -> str:
+    return base64.urlsafe_b64encode(os.urandom(18)).decode("utf-8").rstrip("=")
+
+
+@dataclass
+class RingLog:
+    limit: int = 300
+    items: List[Dict[str, Any]] = field(default_factory=list)
+
+    def add(self, kind: str, data: Dict[str, Any]) -> None:
+        entry = {"ts": _now(), "kind": kind, **data}
+        self.items.append(entry)
+        if len(self.items) > self.limit:
+            self.items = self.items[-self.limit :]
+
+    def dump(self) -> List[Dict[str, Any]]:
+        return list(self.items)
+
+
+@dataclass
+class Session:
+    sid: str
+    context: BrowserContext
+    page: Page
+    created_at: float
+    headless: bool
+    browser_name: str
+    log: RingLog = field(default_factory=lambda: RingLog(limit=400))
+
+    def close(self) -> None:
+        try:
+            self.context.close()
+        finally:
+            pass
+
+
+SESSIONS: Dict[str, Session] = {}
+
+
+def _attach_listeners(sess: Session) -> None:
+    p = sess.page
+
+    def on_console(msg):
+        try:
+            sess.log.add("console", {"type": msg.type, "text": msg.text})
+        except Exception:
+            pass
+
+    def on_page_error(err):
+        try:
+            sess.log.add("pageerror", {"error": str(err)})
+        except Exception:
+            pass
+
+    def on_request_failed(req):
+        try:
+            sess.log.add("requestfailed", {"url": req.url, "failure": str(req.failure)})
+        except Exception:
+            pass
+
+    p.on("console", on_console)
+    p.on("pageerror", on_page_error)
+    p.on("requestfailed", on_request_failed)
+
+
+def _get_sess(sid: str) -> Session:
+    s = SESSIONS.get(sid)
+    if not s:
+        raise KeyError("session_not_found")
+    return s
+
+
+def _get_target(sid: str, t: str) -> Any:
+    if t == "browser":
+        if not _browser:
+            raise RuntimeError("browser_not_started")
+        return _browser
+    s = _get_sess(sid)
+    if t == "context":
+        return s.context
+    if t == "page":
+        return s.page
+    raise ValueError("target must be page|context|browser")
+
+
+def _is_safe_op(op: str) -> bool:
+    # bloqueia métodos/attrs claramente perigosos/irrelevantes
+    if op.startswith("__"):
+        return False
+    if op in {"close"}:
+        return False  # fecha por endpoint próprio
+    return True
+
+
+def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any], ret_mode: str) -> Any:
+    """
+    ret_mode:
+      - "json" (default): retorna o valor como estiver (se não serializar, vira string)
+      - "str": força str(result)
+      - "b64": espera bytes e converte base64
+    """
+    if not _is_safe_op(op):
+        raise ValueError("op_blocked")
+
+    if not UNSAFE_MODE:
+        if op not in ALLOWED.get(t, set()):
+            raise ValueError(f"op_not_allowed: {t}.{op}")
+
+    obj = _get_target(sid, t)
+    fn = getattr(obj, op, None)
+    if fn is None or not callable(fn):
+        raise ValueError(f"no_such_callable: {t}.{op}")
+
+    # timeouts default onde ajuda
+    if t == "page" and op in {"goto", "click", "dblclick", "fill", "type", "press", "hover", "focus", "wait_for_selector"}:
+        kwargs = dict(kwargs)
+        kwargs.setdefault("timeout", DEFAULT_TIMEOUT_MS)
+
+    result = fn(*args, **kwargs)
+
+    if ret_mode == "b64":
+        if isinstance(result, (bytes, bytearray)):
+            return base64.b64encode(bytes(result)).decode("utf-8")
+        # screenshot/pdf retornam bytes; se não retornar bytes, erro explícito
+        raise TypeError("return=b64 requires bytes result")
+
+    if ret_mode == "str":
+        return str(result)
+
+    # ret_mode json
+    try:
+        json.dumps(result)
+        return result
+    except Exception:
+        return str(result)
+
+
+def _summarize_session(s: Session) -> Dict[str, Any]:
+    try:
+        url = s.page.url
+    except Exception:
+        url = None
+    try:
+        title = s.page.title()
+    except Exception:
+        title = None
+    return {
+        "sid": s.sid,
+        "created_at": s.created_at,
+        "age_s": round(_now() - s.created_at, 3),
+        "headless": s.headless,
+        "browser": s.browser_name,
+        "url": url,
+        "title": title,
+        "log_items": len(s.log.items),
+    }
+
+
+# ----------------------------
+# Debug helpers
+# ----------------------------
+def _disk_info(path: str = "/") -> Dict[str, Any]:
+    try:
+        u = shutil.disk_usage(path)
+        return {"path": path, "total": u.total, "used": u.used, "free": u.free}
+    except Exception as e:
+        return {"path": path, "error": str(e)}
+
+
+def _read_text(p: str, max_bytes: int = 200_000) -> Optional[str]:
+    try:
+        with open(p, "rb") as f:
+            data = f.read(max_bytes)
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def _cgroup_hints() -> Dict[str, Any]:
+    # Best-effort: pega umas pistas de quota/limite
+    out = {}
+    # cgroup v2
+    cpu_max = _read_text("/sys/fs/cgroup/cpu.max")
+    mem_max = _read_text("/sys/fs/cgroup/memory.max")
+    if cpu_max:
+        out["cpu.max"] = cpu_max.strip()
+    if mem_max:
+        out["memory.max"] = mem_max.strip()
+    # cgroup v1 fallback
+    cpu_quota = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    cpu_period = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    mem_limit = _read_text("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if cpu_quota:
+        out["cpu.cfs_quota_us"] = cpu_quota.strip()
+    if cpu_period:
+        out["cpu.cfs_period_us"] = cpu_period.strip()
+    if mem_limit:
+        out["memory.limit_in_bytes"] = mem_limit.strip()
+    return out
+
+
+def _list_tree(root: str, max_depth: int = 3, max_items: int = 200) -> List[str]:
+    res = []
+    root = os.path.abspath(root)
+    for base, dirs, files in os.walk(root):
+        depth = base[len(root):].count(os.sep)
+        if depth > max_depth:
+            dirs[:] = []
+            continue
+        for name in sorted(dirs + files):
+            p = os.path.join(base, name)
+            res.append(p)
+            if len(res) >= max_items:
+                return res
+    return res
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@APP.get("/health")
+def health():
+    return jsonify(
+        {
+            "ok": True,
+            "time": _now(),
+            "port": PORT,
+            "python": sys.version,
+            "python_executable": sys.executable,
+            "cwd": os.getcwd(),
+            "browsers_path": BROWSERS_PATH,
+            "running": bool(_pw and _browser),
+            "sessions": len(SESSIONS),
+            "unsafe_mode": UNSAFE_MODE,
+        }
+    )
+
+
+@APP.get("/sysinfo")
+def sysinfo():
+    # super útil pra entender o ambiente (cgroups, disco, etc.)
+    return jsonify(
+        {
+            "ok": True,
+            "time": _now(),
+            "python_executable": sys.executable,
+            "python_version": sys.version,
+            "argv": sys.argv,
+            "cwd": os.getcwd(),
+            "pid": os.getpid(),
+            "uid": os.getuid() if hasattr(os, "getuid") else None,
+            "gid": os.getgid() if hasattr(os, "getgid") else None,
+            "env_keys_sample": sorted(list(os.environ.keys()))[:60],
+            "disk_root": _disk_info("/"),
+            "disk_tmp": _disk_info("/tmp"),
+            "cgroup": _cgroup_hints(),
+            "browsers_path_exists": os.path.exists(BROWSERS_PATH),
+            "browsers_path_list_sample": (os.listdir(BROWSERS_PATH)[:60] if os.path.isdir(BROWSERS_PATH) else []),
+        }
+    )
+
+
+@APP.get("/browsers")
+def browsers():
+    # lista a árvore onde o Playwright baixa os browsers
+    if not os.path.isdir(BROWSERS_PATH):
+        return jsonify({"ok": True, "exists": False, "path": BROWSERS_PATH, "tree": []})
+    tree = _list_tree(BROWSERS_PATH, max_depth=4, max_items=400)
+    return jsonify({"ok": True, "exists": True, "path": BROWSERS_PATH, "tree": tree})
+
+
+@APP.post("/install")
+def install():
+    body = _json_body()
+    browser = body.get("browser", "chromium")
+    res = _install(browser=browser)
+    return jsonify(res), (200 if res["ok"] else 500)
+
+
+@APP.post("/ensure")
+def ensure():
+    body = _json_body()
+    headless = bool(body.get("headless", DEFAULT_HEADLESS))
+    browser = body.get("browser", "chromium")
+    res = _start_playwright(headless=headless, browser=browser)
+    return jsonify(res), (200 if res.get("ok") else 500)
+
+
+@APP.post("/new")
+def new():
+    body = _json_body()
+    headless = bool(body.get("headless", DEFAULT_HEADLESS))
+    browser = body.get("browser", "chromium")
+
+    res = _start_playwright(headless=headless, browser=browser)
+    if not res.get("ok"):
+        return jsonify(res), 500
+
+    with _lock:
+        sid = _new_sid()
+
+        ctx_kwargs: Dict[str, Any] = {}
+        viewport = body.get("viewport")
+        if isinstance(viewport, dict) and "width" in viewport and "height" in viewport:
+            ctx_kwargs["viewport"] = viewport
+
+        # extras úteis
+        if isinstance(body.get("user_agent"), str):
+            ctx_kwargs["user_agent"] = body["user_agent"]
+        if isinstance(body.get("locale"), str):
+            ctx_kwargs["locale"] = body["locale"]
+        if isinstance(body.get("timezone_id"), str):
+            ctx_kwargs["timezone_id"] = body["timezone_id"]
+        if isinstance(body.get("ignore_https_errors"), bool):
+            ctx_kwargs["ignore_https_errors"] = body["ignore_https_errors"]
+
+        context = _browser.new_context(**ctx_kwargs)  # type: ignore
+        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        context.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
+        page = context.new_page()
+
+        sess = Session(
+            sid=sid,
+            context=context,
+            page=page,
+            created_at=_now(),
+            headless=headless,
+            browser_name=browser,
+        )
+        _attach_listeners(sess)
+
+        SESSIONS[sid] = sess
+
+    return jsonify({"ok": True, "sid": sid, "session": _summarize_session(sess), "ensure": res})
+
+
+@APP.get("/sessions")
+def sessions():
+    with _lock:
+        return jsonify({"ok": True, "sessions": [_summarize_session(s) for s in SESSIONS.values()]})
+
+
+@APP.get("/logs")
+def logs():
+    sid = request.args.get("sid", "").strip()
+    if not sid:
+        return jsonify({"ok": False, "error": "missing sid query param"}), 400
+    with _lock:
+        try:
+            s = _get_sess(sid)
+        except KeyError:
+            return jsonify({"ok": False, "error": "session_not_found"}), 404
+        return jsonify({"ok": True, "sid": sid, "logs": s.log.dump()})
+
+
+@APP.post("/close")
+def close():
+    body = _json_body()
+    sid = body.get("sid", "")
+    if not sid:
+        return jsonify({"ok": False, "error": "missing sid"}), 400
+
+    with _lock:
+        sess = SESSIONS.get(sid)
+        if not sess:
+            return jsonify({"ok": False, "error": "session_not_found"}), 404
+        try:
+            sess.close()
+        finally:
+            SESSIONS.pop(sid, None)
+
+    return jsonify({"ok": True, "closed": sid})
+
+
+@APP.post("/stop")
+def stop():
+    _stop_all_noexcept()
+    return jsonify({"ok": True, "status": "stopped"})
+
+
+@APP.post("/do")
+def do():
+    """
+    API flexível:
+    - Um step:
+      {"sid":"...","t":"page|context|browser","op":"goto","args":[...],"kwargs":{...},"return":"json|str|b64"}
+    - Vários:
+      {"sid":"...","steps":[{...},{...}]}
+    Retorna:
+      - results com timing e erro detalhado (traceback)
+    """
+    body = _json_body()
+    sid = str(body.get("sid", "")).strip()
+
+    def exec_step(step: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = _now()
+        t = str(step.get("t", step.get("target", "page"))).strip()
+        op = str(step.get("op", "")).strip()
+        args = step.get("args", [])
+        kwargs = step.get("kwargs", {})
+        ret_mode = str(step.get("return", "json")).strip().lower()
+
+        if not op:
+            raise ValueError("missing op")
+        if not isinstance(args, list):
+            raise ValueError("args must be a list")
+        if not isinstance(kwargs, dict):
+            raise ValueError("kwargs must be an object")
+        if ret_mode not in {"json", "str", "b64"}:
+            raise ValueError("return must be json|str|b64")
+
+        result = _call_op(sid, t, op, args, kwargs, ret_mode)
+        return {
+            "ok": True,
+            "t": t,
+            "op": op,
+            "dt_ms": round((_now() - t0) * 1000, 3),
+            "result": result,
+        }
+
+    steps = body.get("steps")
+    if steps is None:
+        steps = [body]
+    if not isinstance(steps, list) or not steps:
+        return jsonify({"ok": False, "error": "steps must be a non-empty list"}), 400
+
+    out = []
+    with _lock:
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                return jsonify({"ok": False, "error": f"step {i} must be object"}), 400
+            try:
+                r = exec_step(step)
+                out.append(r)
+            except Exception as e:
+                tb = traceback.format_exc(limit=8)
+                out.append(
+                    {
+                        "ok": False,
+                        "step_index": i,
+                        "error": str(e),
+                        "traceback": tb,
+                        "step": step,
+                    }
+                )
+                # para no primeiro erro (pra debug rápido). Se quiser continuar, comenta o break.
+                break
+
+        ok = all(x.get("ok") for x in out)
+        return jsonify({"ok": ok, "results": out}), (200 if ok else 500)
+
+
+# ----------------------------
+# Shutdown hooks
+# ----------------------------
+def _on_exit(*_args):
+    _stop_all_noexcept()
+
+
+atexit.register(_on_exit)
+signal.signal(signal.SIGTERM, _on_exit)
+signal.signal(signal.SIGINT, _on_exit)
+
+
+# ----------------------------
+# Client mode (test rápido)
+# ----------------------------
+def _http_json(url: str, payload: Optional[Dict[str, Any]] = None, method: str = "POST") -> Tuple[int, Dict[str, Any]]:
+    # stdlib only (sem requests)
+    import urllib.request
+
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            code = resp.getcode()
+            body = resp.read().decode("utf-8", errors="ignore")
+            try:
+                return code, json.loads(body)
+            except Exception:
+                return code, {"_raw": body}
+    except Exception as e:
+        return 0, {"ok": False, "error": str(e)}
+
+
+def client_demo(base: str = "http://127.0.0.1:5000"):
+    print("== client demo ==")
+    code, h = _http_json(base + "/health", None, method="GET")
+    print("health:", code, h)
+
+    code, ens = _http_json(base + "/ensure", {"headless": True, "browser": "chromium"})
+    print("ensure:", code, ens)
+
+    code, nw = _http_json(base + "/new", {"headless": True, "viewport": {"width": 1280, "height": 720}})
+    print("new:", code, {"ok": nw.get("ok"), "sid": nw.get("sid")})
+    sid = nw.get("sid")
+    if not sid:
+        print("no sid; abort")
+        return
+
+    steps = [
+        {"sid": sid, "t": "page", "op": "goto", "args": ["https://example.com"], "kwargs": {"wait_until": "domcontentloaded"}},
+        {"sid": sid, "t": "page", "op": "title"},
+        {"sid": sid, "t": "page", "op": "screenshot", "kwargs": {"full_page": True}, "return": "b64"},
+    ]
+    code, res = _http_json(base + "/do", {"sid": sid, "steps": steps})
+    print("do:", code, {"ok": res.get("ok"), "steps": len(res.get("results", []))})
+
+    # salva screenshot local
+    try:
+        b64 = res["results"][2]["result"]
+        img = base64.b64decode(b64.encode("utf-8"))
+        with open("demo.png", "wb") as f:
+            f.write(img)
+        print("saved demo.png")
+    except Exception as e:
+        print("could not save screenshot:", e)
+
+    code, lg = _http_json(base + f"/logs?sid={sid}", None, method="GET")
+    print("logs:", code, f"{len(lg.get('logs', []))} items")
+
+    code, cl = _http_json(base + "/close", {"sid": sid})
+    print("close:", code, cl)
+
+
 if __name__ == "__main__":
-    print(f"[INFO] Iniciando monitor em 0.0.0.0:{PORT}")
-    print(f"[INFO] Scan root: {os.path.abspath(SCAN_ROOT)}")
-    print(f"[INFO] Max depth: {MAX_TREE_DEPTH}")
-    print(f"[INFO] Show hidden: {SHOW_HIDDEN}")
-    print(f"[INFO] Show full env: {SHOW_FULL_ENV}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "client":
+        # se você rodar em outra porta, passe: python pw_remote.py client http://127.0.0.1:XXXX
+        base = sys.argv[2] if len(sys.argv) >= 3 else f"http://127.0.0.1:{PORT}"
+        client_demo(base=base)
+    else:
+        APP.run(host=HOST, port=PORT, threaded=True)
