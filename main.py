@@ -1,49 +1,48 @@
-# main.py — Playwright + Flask (controle remoto) com DEBUG pesado + multi-browser + FS tools + server logs
+# main.py — Render Playwright Remote (LITE)
 #
-# Segurança prática:
-# - Sem auth (como você pediu) = perigoso em público.
-# - Então eu implementei "travamento de filesystem": só deixa mexer dentro de /tmp e /opt/render/project/src.
-# - Sem execução de shell remota (pra não virar uma porta de ransomware acidental).
+# Objetivo:
+# - Leve (1 browser apenas)
+# - Flexível (API genérica /do)
+# - Debugável (prints no log do Render + /sysinfo + /sessions + /fs/*)
+# - Profile opcional via storage_state (path ou b64)
+# - Sem UI, sem multi-browser, sem frescura
 #
-# Playwright sync + greenlet:
-# - PRECISA rodar single-thread. Então: threaded=False e use_reloader=False
-#
-# Endpoints principais:
-#   GET  /                      -> 200
-#   GET  /health
-#   GET  /sysinfo
-#   GET  /server_logs           -> logs do servidor (ring buffer)
-#   POST /server_logs/clear
-#
-# Browsers:
-#   POST /browser/new           -> cria browser {browser_id}
-#   GET  /browser/list          -> lista browsers
-#   POST /browser/close         -> fecha browser {browser_id}
-#   POST /ensure                -> garante browser default
-#   POST /install               -> instala browser (chromium/firefox/webkit)
-#
-# Sessions:
-#   POST /new                   -> cria sessão {sid} (aceita browser_id opcional)
-#   GET  /sessions
-#   GET  /logs?sid=...          -> logs da página (console/pageerror/requestfailed)
-#   POST /close                 -> fecha sessão
-#
-# Exec:
-#   POST /do                    -> step único ou steps
-#
-# Filesystem (restrito a roots seguros):
-#   GET  /fs/list?path=...&max=200
-#   GET  /fs/read?path=...&max_bytes=200000
-#   GET  /fs/stat?path=...
-#   POST /fs/write              -> {path, mode:"text|b64", content, append:bool}
-#   POST /fs/delete             -> {path}
-#
-# Selftest:
-#   POST /selftest              -> vai em example.com e retorna title + screenshot b64
+# Start no Render (recomendado):
+#   gunicorn main:APP --workers 1 --threads 1 --timeout 180
 #
 # Requisitos:
 #   flask
 #   playwright
+#   gunicorn
+#
+# Endpoints:
+#   GET  /                   -> ok
+#   GET  /health
+#   GET  /sysinfo
+#
+#   POST /ensure             -> sobe Playwright+Browser (chromium|firefox|webkit)
+#   POST /install            -> playwright install browser
+#
+#   POST /new                -> cria sessão
+#   GET  /sessions           -> lista sessões
+#   GET  /logs?sid=...       -> logs de página (console/pageerror/requestfailed)
+#   POST /close              -> fecha sessão {sid}
+#   POST /stop               -> fecha tudo (sessões+browser+playwright)
+#
+#   POST /do                 -> executa steps genéricos (page/context/browser)
+#
+#   FS (restrito):
+#   GET  /fs/list?path=...&max=200
+#   GET  /fs/read?path=...&max_bytes=200000
+#   POST /fs/write           -> {path, mode:"text|b64", content, append:bool}
+#   POST /fs/delete          -> {path}
+#
+# Notas:
+# - Render free: cpu 0.15 + ram 512MB. Então: 1 browser, e fecha sessões sempre.
+# - storage_state:
+#     - "storage_state_path": "/tmp/state.json"
+#     - OU "storage_state_b64": base64(json)
+#   O server salva em /tmp e passa no new_context(storage_state=...).
 
 import os
 import sys
@@ -57,7 +56,7 @@ import traceback
 import subprocess
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 from flask import Flask, request, jsonify
 
@@ -73,7 +72,7 @@ from playwright.sync_api import (
 APP = Flask(__name__)
 
 HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "5000"))
+PORT = int(os.getenv("PORT", "10000"))  # Render usa PORT; default 10000
 
 BROWSERS_PATH = "/tmp/ms-playwright"
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
@@ -81,86 +80,28 @@ os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
 DEFAULT_TIMEOUT_MS = 30_000
 DEFAULT_HEADLESS = True
 
-# Sem auth (como você pediu). Mas ainda assim evitamos virar uma bomba acidental:
-SAFE_FS_ROOTS = [
-    "/tmp",
-    "/opt/render/project/src",
-]
-
-# Ring buffer de logs do servidor (prints + exceptions + request log)
-SERVER_LOG_LIMIT = 600
+SAFE_FS_ROOTS = ["/tmp", "/opt/render/project/src"]
 
 _lock = threading.RLock()
 
 _pw: Optional[Playwright] = None
+_browser: Optional[Browser] = None
+_browser_meta: Dict[str, Any] = {}
 
-# multi-browser
-BROWSERS: Dict[str, Browser] = {}  # browser_id -> Browser
-BROWSER_META: Dict[str, Dict[str, Any]] = {}  # browser_id -> info
-
-
+# ---------------------------
+# Utils
+# ---------------------------
 def _now() -> float:
     return time.time()
 
-
-# ---------------------------
-# Server logs (ring buffer)
-# ---------------------------
-@dataclass
-class RingLog:
-    limit: int = 400
-    items: List[Dict[str, Any]] = field(default_factory=list)
-
-    def add(self, kind: str, data: Dict[str, Any]) -> None:
-        self.items.append({"ts": _now(), "kind": kind, **data})
-        if len(self.items) > self.limit:
-            self.items = self.items[-self.limit :]
-
-    def dump(self) -> List[Dict[str, Any]]:
-        return list(self.items)
-
-    def clear(self) -> None:
-        self.items.clear()
-
-
-SERVER_LOG = RingLog(limit=SERVER_LOG_LIMIT)
-
-
-def slog(kind: str, **data):
-    """Log pro ring buffer + stdout (pra você ver no Render log)."""
+def slog(kind: str, **data: Any) -> None:
+    # log em stdout (aparece no Render logs)
     try:
-        SERVER_LOG.add(kind, data)
-    except Exception:
-        pass
-    try:
-        # print “bonito” no stdout
-        msg = f"[{kind}] " + " ".join([f"{k}={repr(v)}" for k, v in data.items()])
+        msg = f"[{kind}] " + " ".join(f"{k}={repr(v)}" for k, v in data.items())
         print(msg, flush=True)
     except Exception:
         pass
 
-
-@APP.before_request
-def _log_request():
-    slog("http_in", method=request.method, path=request.path, ip=request.remote_addr)
-
-
-@APP.after_request
-def _log_response(resp):
-    slog("http_out", method=request.method, path=request.path, status=resp.status_code)
-    return resp
-
-
-@APP.errorhandler(Exception)
-def _handle_exception(e: Exception):
-    tb = traceback.format_exc(limit=20)
-    slog("exception", error=str(e), traceback=tb)
-    return jsonify({"ok": False, "error": str(e), "traceback": tb}), 500
-
-
-# ---------------------------
-# JSON parsing
-# ---------------------------
 def _json_body() -> Dict[str, Any]:
     if request.is_json:
         return request.get_json(silent=True) or {}
@@ -172,18 +113,69 @@ def _json_body() -> Dict[str, Any]:
     except Exception:
         return {"_raw": raw}
 
+def _ensure_dirs() -> None:
+    os.makedirs(BROWSERS_PATH, exist_ok=True)
+
+def _run(cmd: List[str], env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env or os.environ.copy(),
+    )
+
+def _read_text(path: str, max_bytes: int = 200_000) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            return f.read(max_bytes).decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return None
+
+def _disk_info(path: str = "/") -> Dict[str, Any]:
+    try:
+        u = shutil.disk_usage(path)
+        return {"path": path, "total": u.total, "used": u.used, "free": u.free}
+    except Exception as e:
+        return {"path": path, "error": str(e)}
+
+def _proc_status_mem() -> Dict[str, str]:
+    # memória do processo (Linux)
+    out: Dict[str, str] = {}
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmSize:", "VmPeak:", "Threads:")):
+                    k, v = line.split(":", 1)
+                    out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
+
+def _cgroup_hints() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    cpu_max = _read_text("/sys/fs/cgroup/cpu.max")
+    mem_max = _read_text("/sys/fs/cgroup/memory.max")
+    if cpu_max:
+        out["cpu.max"] = cpu_max
+    if mem_max:
+        out["memory.max"] = mem_max
+    # v1 fallback (se existir)
+    mem_v1 = _read_text("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if mem_v1:
+        out["memory.limit_in_bytes"] = mem_v1
+    return out
 
 # ---------------------------
-# Filesystem helpers (SAFE)
+# FS (SAFE)
 # ---------------------------
 def _is_under_roots(abs_path: str) -> bool:
     abs_path = os.path.abspath(abs_path)
     for root in SAFE_FS_ROOTS:
-        root_abs = os.path.abspath(root)
-        if abs_path == root_abs or abs_path.startswith(root_abs + os.sep):
+        r = os.path.abspath(root)
+        if abs_path == r or abs_path.startswith(r + os.sep):
             return True
     return False
-
 
 def _safe_path(p: str) -> str:
     if not isinstance(p, str) or not p.strip():
@@ -193,13 +185,12 @@ def _safe_path(p: str) -> str:
         raise ValueError("path_outside_allowed_roots")
     return ap
 
-
 def _fs_list(path: str, max_items: int = 200) -> Dict[str, Any]:
     ap = _safe_path(path)
     if not os.path.isdir(ap):
         raise ValueError("not_a_directory")
     items = []
-    for name in sorted(os.listdir(ap))[: max_items]:
+    for name in sorted(os.listdir(ap))[:max_items]:
         full = os.path.join(ap, name)
         try:
             st = os.stat(full)
@@ -214,55 +205,33 @@ def _fs_list(path: str, max_items: int = 200) -> Dict[str, Any]:
             items.append({"name": name, "path": full, "error": str(e)})
     return {"path": ap, "items": items}
 
-
 def _fs_read(path: str, max_bytes: int = 200_000) -> Dict[str, Any]:
     ap = _safe_path(path)
     if not os.path.isfile(ap):
         raise ValueError("not_a_file")
     with open(ap, "rb") as f:
         data = f.read(max_bytes)
-    # tenta decode como texto (pra debug rápido)
     try:
-        text = data.decode("utf-8")
-        return {"path": ap, "mode": "text", "text": text, "bytes": len(data)}
+        return {"path": ap, "mode": "text", "text": data.decode("utf-8"), "bytes": len(data)}
     except Exception:
         return {"path": ap, "mode": "b64", "b64": base64.b64encode(data).decode("utf-8"), "bytes": len(data)}
 
-
-def _fs_stat(path: str) -> Dict[str, Any]:
-    ap = _safe_path(path)
-    st = os.stat(ap)
-    return {
-        "path": ap,
-        "is_dir": os.path.isdir(ap),
-        "is_file": os.path.isfile(ap),
-        "size": st.st_size,
-        "mtime": st.st_mtime,
-        "mode": st.st_mode,
-    }
-
-
-def _fs_write(path: str, mode: str, content: str, append: bool = False) -> Dict[str, Any]:
+def _fs_write(path: str, mode: str, content: str, append: bool) -> Dict[str, Any]:
     ap = _safe_path(path)
     os.makedirs(os.path.dirname(ap), exist_ok=True)
-
     if mode == "text":
         data = content.encode("utf-8")
     elif mode == "b64":
         data = base64.b64decode(content.encode("utf-8"))
     else:
         raise ValueError("mode_must_be_text_or_b64")
-
-    file_mode = "ab" if append else "wb"
-    with open(ap, file_mode) as f:
+    with open(ap, "ab" if append else "wb") as f:
         f.write(data)
     return {"path": ap, "bytes_written": len(data), "append": append}
-
 
 def _fs_delete(path: str) -> Dict[str, Any]:
     ap = _safe_path(path)
     if os.path.isdir(ap):
-        # pra evitar apagar pasta inteira sem querer, exige vazio
         if os.listdir(ap):
             raise ValueError("directory_not_empty")
         os.rmdir(ap)
@@ -272,24 +241,9 @@ def _fs_delete(path: str) -> Dict[str, Any]:
         return {"path": ap, "deleted": True, "type": "file"}
     raise ValueError("path_not_found")
 
-
 # ---------------------------
-# Playwright / Browser management
+# Playwright / Browser (1 only)
 # ---------------------------
-def _ensure_dirs():
-    os.makedirs(BROWSERS_PATH, exist_ok=True)
-
-
-def _run(cmd: List[str], env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env or os.environ.copy(),
-    )
-
-
 def _install(browser: str = "chromium") -> Dict[str, Any]:
     _ensure_dirs()
     env = os.environ.copy()
@@ -307,7 +261,6 @@ def _install(browser: str = "chromium") -> Dict[str, Any]:
         "python": sys.executable,
     }
 
-
 def _ensure_pw_started() -> None:
     global _pw
     if _pw is None:
@@ -315,110 +268,105 @@ def _ensure_pw_started() -> None:
         _pw = sync_playwright().start()
         slog("pw_start", ok=True)
 
-
 def _launch_browser(browser: str, headless: bool) -> Browser:
     _ensure_pw_started()
 
+    # Render-friendly chromium flags (ainda leve)
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+    ]
+
     if browser == "chromium":
-        return _pw.chromium.launch(
-            headless=headless,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
+        return _pw.chromium.launch(headless=headless, args=chromium_args)  # type: ignore
     if browser == "firefox":
-        return _pw.firefox.launch(headless=headless)
+        return _pw.firefox.launch(headless=headless)  # type: ignore
     if browser == "webkit":
-        return _pw.webkit.launch(headless=headless)
+        return _pw.webkit.launch(headless=headless)  # type: ignore
     raise ValueError("browser must be chromium|firefox|webkit")
 
-
-def _browser_new(browser: str = "chromium", headless: bool = DEFAULT_HEADLESS, browser_id: Optional[str] = None) -> Dict[str, Any]:
+def _ensure_browser(browser: str = "chromium", headless: bool = DEFAULT_HEADLESS) -> Dict[str, Any]:
+    global _browser, _browser_meta
     with _lock:
-        _ensure_pw_started()
-        if not browser_id:
-            browser_id = base64.urlsafe_b64encode(os.urandom(10)).decode("utf-8").rstrip("=")
-
-        if browser_id in BROWSERS:
-            raise ValueError("browser_id_already_exists")
-
+        if _browser is not None:
+            return {"ok": True, "status": "already_running", **_browser_meta}
         try:
-            b = _launch_browser(browser=browser, headless=headless)
-        except PWError as e:
-            # tenta instalar e relançar
+            _browser = _launch_browser(browser=browser, headless=headless)
+        except PWError:
             inst = _install(browser=browser)
-            if not inst["ok"]:
-                raise RuntimeError(f"install_failed: {inst['stderr_tail']}")
-            b = _launch_browser(browser=browser, headless=headless)
-
-        BROWSERS[browser_id] = b
-        BROWSER_META[browser_id] = {
+            if not inst.get("ok"):
+                return {"ok": False, "status": "install_failed", "install": inst}
+            _browser = _launch_browser(browser=browser, headless=headless)
+        _browser_meta = {
             "browser": browser,
             "headless": headless,
             "created_at": _now(),
         }
-        slog("browser_new", browser_id=browser_id, browser=browser, headless=headless)
-        return {"ok": True, "browser_id": browser_id, **BROWSER_META[browser_id]}
+        slog("browser_ready", **_browser_meta)
+        return {"ok": True, "status": "started", **_browser_meta}
 
-
-def _browser_get(browser_id: str) -> Browser:
-    b = BROWSERS.get(browser_id)
-    if not b:
-        raise KeyError("browser_not_found")
-    return b
-
-
-def _browser_close(browser_id: str) -> Dict[str, Any]:
+def _stop_all_noexcept() -> None:
+    global _pw, _browser, _browser_meta
     with _lock:
-        b = _browser_get(browser_id)
+        # close sessions
+        for sid in list(SESSIONS.keys()):
+            try:
+                SESSIONS[sid].close()
+            except Exception:
+                pass
+            SESSIONS.pop(sid, None)
+
+        # close browser
         try:
-            b.close()
-        finally:
-            BROWSERS.pop(browser_id, None)
-            meta = BROWSER_META.pop(browser_id, None) or {}
-        slog("browser_close", browser_id=browser_id)
-        return {"ok": True, "browser_id": browser_id, "meta": meta}
+            if _browser:
+                _browser.close()
+        except Exception:
+            pass
+        _browser = None
+        _browser_meta = {}
 
-
-def _browser_list() -> List[Dict[str, Any]]:
-    out = []
-    for bid, meta in BROWSER_META.items():
-        out.append({
-            "browser_id": bid,
-            **meta,
-            "alive": bid in BROWSERS,
-        })
-    return out
-
-
-def _ensure_default_browser(headless: bool, browser: str) -> Dict[str, Any]:
-    # default browser_id = "default"
-    with _lock:
-        if "default" in BROWSERS:
-            return {"ok": True, "status": "already_running", "browser_id": "default", **BROWSER_META.get("default", {})}
-        return _browser_new(browser=browser, headless=headless, browser_id="default")
-
+        # stop pw
+        try:
+            if _pw:
+                _pw.stop()
+        except Exception:
+            pass
+        _pw = None
+    slog("stop_all", ok=True)
 
 # ---------------------------
-# Sessions + page logs
+# Sessions + logs
 # ---------------------------
-def _new_sid() -> str:
-    return base64.urlsafe_b64encode(os.urandom(18)).decode("utf-8").rstrip("=")
+def _new_id(nbytes: int = 18) -> str:
+    return base64.urlsafe_b64encode(os.urandom(nbytes)).decode("utf-8").rstrip("=")
 
+@dataclass
+class RingLog:
+    limit: int = 250
+    items: List[Dict[str, Any]] = field(default_factory=list)
+
+    def add(self, kind: str, data: Dict[str, Any]) -> None:
+        self.items.append({"ts": _now(), "kind": kind, **data})
+        if len(self.items) > self.limit:
+            self.items = self.items[-self.limit:]
+
+    def dump(self) -> List[Dict[str, Any]]:
+        return list(self.items)
 
 @dataclass
 class Session:
     sid: str
-    browser_id: str
     context: BrowserContext
     page: Page
     created_at: float
-    log: RingLog = field(default_factory=lambda: RingLog(limit=500))
+    log: RingLog = field(default_factory=lambda: RingLog(limit=300))
 
     def close(self) -> None:
         self.context.close()
 
-
 SESSIONS: Dict[str, Session] = {}
-
 
 def _attach_listeners(sess: Session) -> None:
     p = sess.page
@@ -445,15 +393,13 @@ def _attach_listeners(sess: Session) -> None:
     p.on("pageerror", on_page_error)
     p.on("requestfailed", on_request_failed)
 
-
 def _get_sess(sid: str) -> Session:
     s = SESSIONS.get(sid)
     if not s:
         raise KeyError("session_not_found")
     return s
 
-
-def _summarize_session(s: Session) -> Dict[str, Any]:
+def _summ_sess(s: Session) -> Dict[str, Any]:
     try:
         url = s.page.url
     except Exception:
@@ -464,7 +410,6 @@ def _summarize_session(s: Session) -> Dict[str, Any]:
         title = None
     return {
         "sid": s.sid,
-        "browser_id": s.browser_id,
         "created_at": s.created_at,
         "age_s": round(_now() - s.created_at, 3),
         "url": url,
@@ -472,9 +417,8 @@ def _summarize_session(s: Session) -> Dict[str, Any]:
         "log_items": len(s.log.items),
     }
 
-
 # ---------------------------
-# /do execution engine
+# /do engine
 # ---------------------------
 def _is_safe_op(op: str) -> bool:
     if op.startswith("__"):
@@ -483,21 +427,18 @@ def _is_safe_op(op: str) -> bool:
         return False
     return True
 
-
 def _jsonable(x: Any) -> Any:
-    """Tenta tornar retorno serializável."""
     try:
         json.dumps(x)
         return x
     except Exception:
         return str(x)
 
-
-def _get_target(sid: str, t: str, browser_id: Optional[str]) -> Any:
+def _get_target(sid: str, t: str) -> Any:
     if t == "browser":
-        bid = browser_id or "default"
-        return _browser_get(bid)
-
+        if _browser is None:
+            raise RuntimeError("browser_not_started")
+        return _browser
     s = _get_sess(sid)
     if t == "context":
         return s.context
@@ -505,17 +446,15 @@ def _get_target(sid: str, t: str, browser_id: Optional[str]) -> Any:
         return s.page
     raise ValueError("target must be page|context|browser")
 
-
-def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any], ret_mode: str, browser_id: Optional[str]) -> Any:
+def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any], ret_mode: str) -> Any:
     if not _is_safe_op(op):
         raise ValueError("op_blocked")
 
-    obj = _get_target(sid=sid, t=t, browser_id=browser_id)
+    obj = _get_target(sid, t)
     fn = getattr(obj, op, None)
     if fn is None or not callable(fn):
         raise ValueError(f"no_such_callable: {t}.{op}")
 
-    # timeouts default
     if t == "page" and op in {"goto", "click", "dblclick", "fill", "type", "press", "hover", "focus", "wait_for_selector"}:
         kwargs = dict(kwargs)
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT_MS)
@@ -532,159 +471,85 @@ def _call_op(sid: str, t: str, op: str, args: List[Any], kwargs: Dict[str, Any],
 
     return _jsonable(result)
 
-
-# ---------------------------
-# Sysinfo helpers
-# ---------------------------
-def _disk_info(path: str = "/") -> Dict[str, Any]:
-    try:
-        u = shutil.disk_usage(path)
-        return {"path": path, "total": u.total, "used": u.used, "free": u.free}
-    except Exception as e:
-        return {"path": path, "error": str(e)}
-
-
-def _read_text(p: str, max_bytes: int = 200_000) -> Optional[str]:
-    try:
-        with open(p, "rb") as f:
-            data = f.read(max_bytes)
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return None
-
-
-def _cgroup_hints() -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    cpu_max = _read_text("/sys/fs/cgroup/cpu.max")
-    mem_max = _read_text("/sys/fs/cgroup/memory.max")
-    if cpu_max:
-        out["cpu.max"] = cpu_max.strip()
-    if mem_max:
-        out["memory.max"] = mem_max.strip()
-    return out
-
-
 # ---------------------------
 # Routes
 # ---------------------------
+@APP.errorhandler(Exception)
+def _handle_exc(e: Exception):
+    tb = traceback.format_exc(limit=15)
+    slog("exception", error=str(e))
+    return jsonify({"ok": False, "error": str(e), "traceback": tb}), 500
+
 @APP.get("/")
 def root():
-    return jsonify({"ok": True, "hint": "use /health /sysinfo /server_logs /browser/list /new /do /sessions /logs"})
-
+    return jsonify({"ok": True, "hint": "use /health /sysinfo /ensure /new /do /sessions /logs /fs/* /stop"})
 
 @APP.get("/health")
 def health():
     return jsonify({
         "ok": True,
         "time": _now(),
-        "port": PORT,
-        "python_executable": sys.executable,
+        "pid": os.getpid(),
         "cwd": os.getcwd(),
+        "python": sys.version,
+        "python_executable": sys.executable,
         "browsers_path": BROWSERS_PATH,
         "pw_running": _pw is not None,
-        "browsers": len(BROWSERS),
+        "browser_running": _browser is not None,
+        "browser_meta": _browser_meta,
         "sessions": len(SESSIONS),
         "safe_fs_roots": SAFE_FS_ROOTS,
     })
-
 
 @APP.get("/sysinfo")
 def sysinfo():
     return jsonify({
         "ok": True,
         "time": _now(),
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
         "python_executable": sys.executable,
         "python_version": sys.version,
-        "cwd": os.getcwd(),
-        "pid": os.getpid(),
         "disk_root": _disk_info("/"),
         "disk_tmp": _disk_info("/tmp"),
         "cgroup": _cgroup_hints(),
-        "env_keys_sample": sorted(list(os.environ.keys()))[:100],
+        "process_mem": _proc_status_mem(),
         "browsers_path_exists": os.path.exists(BROWSERS_PATH),
         "browsers_path_list_sample": (os.listdir(BROWSERS_PATH)[:80] if os.path.isdir(BROWSERS_PATH) else []),
+        "env_keys_sample": sorted(list(os.environ.keys()))[:80],
     })
 
-
-@APP.get("/server_logs")
-def server_logs():
-    # pode passar ?tail=100
-    try:
-        tail = int(request.args.get("tail", "200"))
-    except Exception:
-        tail = 200
-    logs = SERVER_LOG.dump()
-    if tail > 0:
-        logs = logs[-tail:]
-    return jsonify({"ok": True, "count": len(SERVER_LOG.items), "tail": tail, "logs": logs})
-
-
-@APP.post("/server_logs/clear")
-def server_logs_clear():
-    SERVER_LOG.clear()
-    return jsonify({"ok": True})
-
-
-# ---- Browsers ----
 @APP.post("/install")
 def install():
     body = _json_body()
     browser = body.get("browser", "chromium")
     res = _install(browser=browser)
-    return jsonify(res), (200 if res["ok"] else 500)
-
+    return jsonify(res), (200 if res.get("ok") else 500)
 
 @APP.post("/ensure")
 def ensure():
     body = _json_body()
-    headless = bool(body.get("headless", DEFAULT_HEADLESS))
     browser = body.get("browser", "chromium")
-    res = _ensure_default_browser(headless=headless, browser=browser)
+    headless = bool(body.get("headless", DEFAULT_HEADLESS))
+    res = _ensure_browser(browser=browser, headless=headless)
     return jsonify(res), (200 if res.get("ok") else 500)
 
-
-@APP.post("/browser/new")
-def browser_new():
-    body = _json_body()
-    browser = body.get("browser", "chromium")
-    headless = bool(body.get("headless", DEFAULT_HEADLESS))
-    browser_id = body.get("browser_id")
-    res = _browser_new(browser=browser, headless=headless, browser_id=browser_id)
-    return jsonify(res)
-
-
-@APP.get("/browser/list")
-def browser_list():
-    return jsonify({"ok": True, "browsers": _browser_list()})
-
-
-@APP.post("/browser/close")
-def browser_close():
-    body = _json_body()
-    browser_id = body.get("browser_id")
-    if not browser_id:
-        return jsonify({"ok": False, "error": "missing browser_id"}), 400
-    res = _browser_close(browser_id=browser_id)
-    return jsonify(res)
-
-
-# ---- Sessions ----
 @APP.post("/new")
 def new():
     body = _json_body()
-    # escolhe browser
-    browser_id = body.get("browser_id", "default")
+    browser = body.get("browser", "chromium")
     headless = bool(body.get("headless", DEFAULT_HEADLESS))
-    browser_name = body.get("browser", "chromium")
 
-    # garante default se pediram default
-    if browser_id == "default" and "default" not in BROWSERS:
-        _ensure_default_browser(headless=headless, browser=browser_name)
+    ens = _ensure_browser(browser=browser, headless=headless)
+    if not ens.get("ok"):
+        return jsonify({"ok": False, "stage": "ensure", "ensure": ens}), 500
+
+    # storage_state (path ou b64)
+    storage_state_path = body.get("storage_state_path")
+    storage_state_b64 = body.get("storage_state_b64")
 
     with _lock:
-        sid = _new_sid()
-        b = _browser_get(browser_id)
-
+        sid = _new_id()
         ctx_kwargs: Dict[str, Any] = {}
 
         viewport = body.get("viewport")
@@ -699,32 +564,43 @@ def new():
         if isinstance(body.get("ignore_https_errors"), bool):
             ctx_kwargs["ignore_https_errors"] = body["ignore_https_errors"]
 
-        context = b.new_context(**ctx_kwargs)
+        # se veio b64, salvar em /tmp
+        if isinstance(storage_state_b64, str) and storage_state_b64.strip():
+            try:
+                raw = base64.b64decode(storage_state_b64.encode("utf-8"))
+                p = f"/tmp/storage_state_{sid}.json"
+                with open(p, "wb") as f:
+                    f.write(raw)
+                ctx_kwargs["storage_state"] = p
+                slog("storage_state_b64_saved", sid=sid, path=p, bytes=len(raw))
+            except Exception as e:
+                return jsonify({"ok": False, "error": f"bad storage_state_b64: {e}"}), 400
+        elif isinstance(storage_state_path, str) and storage_state_path.strip():
+            try:
+                sp = _safe_path(storage_state_path)
+                ctx_kwargs["storage_state"] = sp
+                slog("storage_state_path", sid=sid, path=sp)
+            except Exception as e:
+                return jsonify({"ok": False, "error": f"bad storage_state_path: {e}"}), 400
+
+        assert _browser is not None
+        context = _browser.new_context(**ctx_kwargs)
         context.set_default_timeout(DEFAULT_TIMEOUT_MS)
         context.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
-
         page = context.new_page()
 
-        sess = Session(
-            sid=sid,
-            browser_id=browser_id,
-            context=context,
-            page=page,
-            created_at=_now(),
-        )
+        sess = Session(sid=sid, context=context, page=page, created_at=_now())
         _attach_listeners(sess)
         SESSIONS[sid] = sess
 
-        slog("session_new", sid=sid, browser_id=browser_id)
+        slog("session_new", sid=sid, has_storage_state=("storage_state" in ctx_kwargs))
 
-    return jsonify({"ok": True, "sid": sid, "session": _summarize_session(sess), "browser_id": browser_id})
-
+    return jsonify({"ok": True, "sid": sid, "session": _summ_sess(sess), "ensure": ens})
 
 @APP.get("/sessions")
 def sessions():
     with _lock:
-        return jsonify({"ok": True, "sessions": [_summarize_session(s) for s in SESSIONS.values()]})
-
+        return jsonify({"ok": True, "sessions": [_summ_sess(s) for s in SESSIONS.values()]})
 
 @APP.get("/logs")
 def logs():
@@ -733,7 +609,6 @@ def logs():
         return jsonify({"ok": False, "error": "missing sid query param"}), 400
     with _lock:
         s = _get_sess(sid)
-        # tail opcional
         try:
             tail = int(request.args.get("tail", "200"))
         except Exception:
@@ -742,7 +617,6 @@ def logs():
         if tail > 0:
             items = items[-tail:]
         return jsonify({"ok": True, "sid": sid, "count": len(s.log.items), "tail": tail, "logs": items})
-
 
 @APP.post("/close")
 def close():
@@ -763,53 +637,13 @@ def close():
 
     return jsonify({"ok": True, "closed": sid})
 
-
 @APP.post("/stop")
 def stop():
-    with _lock:
-        # fecha sessões
-        for sid in list(SESSIONS.keys()):
-            try:
-                SESSIONS[sid].close()
-            except Exception:
-                pass
-            SESSIONS.pop(sid, None)
-
-        # fecha browsers
-        for bid in list(BROWSERS.keys()):
-            try:
-                BROWSERS[bid].close()
-            except Exception:
-                pass
-            BROWSERS.pop(bid, None)
-            BROWSER_META.pop(bid, None)
-
-        # fecha PW
-        global _pw
-        try:
-            if _pw:
-                _pw.stop()
-        except Exception:
-            pass
-        _pw = None
-
-    slog("stop_all")
+    _stop_all_noexcept()
     return jsonify({"ok": True, "status": "stopped"})
-
 
 @APP.post("/do")
 def do():
-    """
-    API flexível:
-      - single:
-        {"sid":"...","t":"page|context|browser","op":"goto","args":[...],"kwargs":{...},"return":"json|str|b64","browser_id":"..."}
-      - multi:
-        {"sid":"...","steps":[{...},{...}]}
-
-    Extras:
-      - step pode trazer browser_id (pra target=browser)
-      - retorna dt_ms e traceback em erro
-    """
     body = _json_body()
     top_sid = (body.get("sid") or "").strip()
     steps = body.get("steps")
@@ -819,6 +653,8 @@ def do():
     if not isinstance(steps, list) or not steps:
         return jsonify({"ok": False, "error": "steps must be a non-empty list"}), 400
 
+    out: List[Dict[str, Any]] = []
+
     def exec_step(step: Dict[str, Any]) -> Dict[str, Any]:
         t0 = _now()
         sid = (step.get("sid") or top_sid or "").strip()
@@ -827,7 +663,6 @@ def do():
         args = step.get("args", [])
         kwargs = step.get("kwargs", {})
         ret_mode = str(step.get("return", "json")).strip().lower()
-        browser_id = step.get("browser_id")
 
         if not op:
             raise ValueError("missing op")
@@ -840,7 +675,7 @@ def do():
         if ret_mode not in {"json", "str", "b64"}:
             raise ValueError("return must be json|str|b64")
 
-        result = _call_op(sid=sid, t=t, op=op, args=args, kwargs=kwargs, ret_mode=ret_mode, browser_id=browser_id)
+        result = _call_op(sid=sid, t=t, op=op, args=args, kwargs=kwargs, ret_mode=ret_mode)
         return {
             "ok": True,
             "sid": sid,
@@ -850,38 +685,38 @@ def do():
             "result": result,
         }
 
-    out: List[Dict[str, Any]] = []
     with _lock:
         for i, step in enumerate(steps):
             if not isinstance(step, dict):
                 return jsonify({"ok": False, "error": f"step {i} must be object"}), 400
             try:
-                out.append(exec_step(step))
+                r = exec_step(step)
+                out.append(r)
+                slog("do_step", i=i, t=r["t"], op=r["op"], dt_ms=r["dt_ms"])
             except Exception as e:
                 out.append({
                     "ok": False,
                     "step_index": i,
                     "error": str(e),
-                    "traceback": traceback.format_exc(limit=15),
+                    "traceback": traceback.format_exc(limit=12),
                     "step": step,
                 })
+                slog("do_error", i=i, error=str(e))
                 break
 
     ok = all(x.get("ok") for x in out)
     return jsonify({"ok": ok, "results": out}), (200 if ok else 500)
 
-
-# ---- Filesystem endpoints ----
+# ---- FS routes ----
 @APP.get("/fs/list")
 def fs_list():
-    path = request.args.get("path", "/opt/render/project/src")
+    path = request.args.get("path", "/tmp")
     try:
         max_items = int(request.args.get("max", "200"))
     except Exception:
         max_items = 200
     res = _fs_list(path=path, max_items=max_items)
     return jsonify({"ok": True, **res})
-
 
 @APP.get("/fs/read")
 def fs_read():
@@ -894,16 +729,6 @@ def fs_read():
         max_bytes = 200_000
     res = _fs_read(path=path, max_bytes=max_bytes)
     return jsonify({"ok": True, **res})
-
-
-@APP.get("/fs/stat")
-def fs_stat():
-    path = request.args.get("path", "")
-    if not path:
-        return jsonify({"ok": False, "error": "missing path"}), 400
-    res = _fs_stat(path=path)
-    return jsonify({"ok": True, **res})
-
 
 @APP.post("/fs/write")
 def fs_write():
@@ -919,7 +744,6 @@ def fs_write():
     res = _fs_write(path=path, mode=mode, content=content, append=append)
     return jsonify({"ok": True, **res})
 
-
 @APP.post("/fs/delete")
 def fs_delete():
     body = _json_body()
@@ -929,83 +753,17 @@ def fs_delete():
     res = _fs_delete(path=path)
     return jsonify({"ok": True, **res})
 
-
-# ---- Selftest ----
-@APP.post("/selftest")
-def selftest():
-    body = _json_body()
-    url = body.get("url", "https://example.com")
-    headless = bool(body.get("headless", True))
-    browser_name = body.get("browser", "chromium")
-
-    # usa browser default
-    _ensure_default_browser(headless=headless, browser=browser_name)
-
-    sid = None
-    with _lock:
-        sid = _new_sid()
-        b = _browser_get("default")
-        ctx = b.new_context()
-        ctx.set_default_timeout(DEFAULT_TIMEOUT_MS)
-        ctx.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
-        page = ctx.new_page()
-
-        sess = Session(sid=sid, browser_id="default", context=ctx, page=page, created_at=_now())
-        _attach_listeners(sess)
-
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
-            title = page.title()
-            shot = page.screenshot(full_page=True)
-            shot_b64 = base64.b64encode(shot).decode("utf-8")
-            logs_tail = sess.log.dump()[-50:]
-        finally:
-            try:
-                sess.close()
-            except Exception:
-                pass
-
-    return jsonify({"ok": True, "url": url, "title": title, "screenshot_b64": shot_b64, "logs_tail": logs_tail})
-
-
 # ---------------------------
 # shutdown hooks
 # ---------------------------
 def _on_exit(*_args):
-    try:
-        with _lock:
-            for sid in list(SESSIONS.keys()):
-                try:
-                    SESSIONS[sid].close()
-                except Exception:
-                    pass
-                SESSIONS.pop(sid, None)
-
-            for bid in list(BROWSERS.keys()):
-                try:
-                    BROWSERS[bid].close()
-                except Exception:
-                    pass
-                BROWSERS.pop(bid, None)
-                BROWSER_META.pop(bid, None)
-
-            global _pw
-            if _pw:
-                try:
-                    _pw.stop()
-                except Exception:
-                    pass
-            _pw = None
-    except Exception:
-        pass
-
+    _stop_all_noexcept()
 
 atexit.register(_on_exit)
 signal.signal(signal.SIGTERM, _on_exit)
 signal.signal(signal.SIGINT, _on_exit)
 
-
-if __name__ == "__main__":
-    slog("boot", port=PORT, cwd=os.getcwd())
-    # single-thread obrigatório pro Playwright sync
-    APP.run(host=HOST, port=PORT, threaded=False, use_reloader=False)
+# NÃO use APP.run() no Render com gunicorn.
+# Se você rodar local sem gunicorn, descomente:
+# if __name__ == "__main__":
+#     APP.run(host=HOST, port=PORT, threaded=False, use_reloader=False)
